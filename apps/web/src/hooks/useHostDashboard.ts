@@ -24,6 +24,8 @@ export interface HostProperty {
   location: string;
   price_per_night: number;
   status: string;
+  draft_status: string;
+  moderation_state: string;
   active_bookings: number;
   total_bookings: number;
   average_rating: number;
@@ -40,6 +42,12 @@ export function useHostDashboard() {
   const [isLoadingProperties, setIsLoadingProperties] = useState(true);
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const [propertiesError, setPropertiesError] = useState<string | null>(null);
+
+  // Filter/pagination state — the dashboard page can read these to keep UI in sync
+  const [propertiesPage, setPropertiesPage] = useState(1);
+  const [propertiesLimit] = useState(20);
+  const [statusFilter, setStatusFilter] = useState<string>('');
+  const [searchQuery, setSearchQuery] = useState('');
 
   // Synchronous in-flight guards: the loading state lands a tick late, so
   // retries (button + effect overlap, or a double click) could otherwise
@@ -67,25 +75,31 @@ export function useHostDashboard() {
     }
   }, []);
 
-  const fetchProperties = useCallback(async (page = 1, limit = 20) => {
-    if (propertiesInFlightRef.current) return;
-    propertiesInFlightRef.current = true;
-    setIsLoadingProperties(true);
-    setPropertiesError(null);
-    try {
-      const params = new URLSearchParams({ page: String(page), limit: String(limit) });
-      const res = await fetch(`${BASE}/properties?${params}`, { headers: authHeaders() });
-      if (!res.ok) throw new Error('Failed to load properties');
-      const data: { properties: HostProperty[]; total: number } = await res.json();
-      setProperties(data.properties);
-      setTotalProperties(data.total);
-    } catch (err) {
-      setPropertiesError(err instanceof Error ? err.message : 'Failed to load properties');
-    } finally {
-      propertiesInFlightRef.current = false;
-      setIsLoadingProperties(false);
-    }
-  }, []);
+  const fetchProperties = useCallback(
+    async (page = 1, limit = 20, status = '', search = '') => {
+      if (propertiesInFlightRef.current) return;
+      propertiesInFlightRef.current = true;
+      setIsLoadingProperties(true);
+      setPropertiesError(null);
+      try {
+        const params = new URLSearchParams({ page: String(page), limit: String(limit) });
+        if (status) params.set('status', status);
+        if (search) params.set('q', search);
+        const res = await fetch(`${BASE}/properties?${params}`, { headers: authHeaders() });
+        if (!res.ok) throw new Error('Failed to load properties');
+        const data: { properties: HostProperty[]; total: number } = await res.json();
+        setProperties(data.properties);
+        setTotalProperties(data.total);
+        setPropertiesPage(page);
+      } catch (err) {
+        setPropertiesError(err instanceof Error ? err.message : 'Failed to load properties');
+      } finally {
+        propertiesInFlightRef.current = false;
+        setIsLoadingProperties(false);
+      }
+    },
+    [],
+  );
 
   const updatePropertyStatus = useCallback(
     async (
@@ -103,8 +117,8 @@ export function useHostDashboard() {
           body: JSON.stringify({ status }),
         });
         if (!res.ok) return false;
-        // Refresh properties list after status update
-        await fetchProperties();
+        // Refresh properties list after status update, preserving current filters
+        await fetchProperties(propertiesPage, propertiesLimit, statusFilter, searchQuery);
         return true;
       } catch {
         return false;
@@ -112,7 +126,7 @@ export function useHostDashboard() {
         updatingIdsRef.current.delete(propertyId);
       }
     },
-    [fetchProperties],
+    [fetchProperties, propertiesPage, propertiesLimit, statusFilter, searchQuery],
   );
 
   useEffect(() => {
@@ -128,6 +142,12 @@ export function useHostDashboard() {
     isLoadingProperties,
     summaryError,
     propertiesError,
+    propertiesPage,
+    propertiesLimit,
+    statusFilter,
+    searchQuery,
+    setStatusFilter,
+    setSearchQuery,
     refetchSummary: fetchSummary,
     refetchProperties: fetchProperties,
     updatePropertyStatus,

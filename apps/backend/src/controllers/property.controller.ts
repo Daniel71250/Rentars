@@ -763,6 +763,53 @@ export async function getPropertyVersionsHandler(req: AuthRequest, res: Response
 }
 
 /**
+ * GET /api/v1/properties/:id/publish-readiness
+ *
+ * Returns the publish readiness status for a draft property. Owner-only.
+ * Response: { ready: boolean; missingFields: string[]; imageCount: number }
+ */
+export async function getPublishReadinessHandler(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const propertyId = req.params.id as string;
+
+  const { supabase: supabaseClient } = await import('../config/supabase.js');
+
+  // Verify ownership
+  const { data: property, error: propError } = await supabaseClient
+    .from('properties')
+    .select('*')
+    .eq('id', propertyId)
+    .eq('owner_id', userId)
+    .maybeSingle();
+
+  if (propError || !property) {
+    res.status(404).json({ error: 'Property not found' });
+    return;
+  }
+
+  const { count: imageCount } = await supabaseClient
+    .from('property_images')
+    .select('id', { count: 'exact', head: true })
+    .eq('property_id', propertyId)
+    .in('moderation_status', ['pending', 'approved']);
+
+  const { getPublishReadiness } = await import('../services/property.service.js');
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const readiness = getPublishReadiness(property as any, imageCount ?? 0);
+
+  res.json({
+    ready: readiness.ready,
+    missingFields: readiness.missingFields,
+    imageCount: imageCount ?? 0,
+  });
+}
+
+/**
  * POST /api/v1/properties/:id/versions/:versionId/rollback
  *
  * Restore a property to a prior version.  Creates a new version record rather

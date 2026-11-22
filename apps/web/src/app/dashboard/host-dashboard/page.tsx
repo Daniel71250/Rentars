@@ -32,14 +32,19 @@ export default function HostDashboard() {
   const {
     summary,
     properties,
+    totalProperties,
     isLoadingSummary,
     isLoadingProperties,
     summaryError,
     propertiesError,
+    propertiesPage,
+    propertiesLimit,
     refetchSummary,
     refetchProperties,
     updatePropertyStatus,
   } = useHostDashboard();
+
+  const inventoryTotalPages = Math.ceil(totalProperties / propertiesLimit);
 
   const handleAddProperty = () => {
     setShowAddProperty(false);
@@ -167,7 +172,14 @@ export default function HostDashboard() {
           ) : (
             <HostPropertiesTable
               properties={properties}
+              total={totalProperties}
+              page={propertiesPage}
+              totalPages={inventoryTotalPages}
               onStatusChange={updatePropertyStatus}
+              onFilterChange={(status, search) =>
+                refetchProperties(1, propertiesLimit, status, search)
+              }
+              onPageChange={(p) => refetchProperties(p, propertiesLimit)}
             />
           )}
         </section>

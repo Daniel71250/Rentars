@@ -15,6 +15,8 @@ export interface HostProperty {
   location: string;
   price_per_night: number;
   status: string;
+  draft_status: string;
+  moderation_state: string;
   active_bookings: number;
   total_bookings: number;
   average_rating: number;
@@ -101,31 +103,48 @@ export async function getHostDashboardSummary(
 
 /**
  * Returns the host's properties enriched with booking counts and ratings.
+ * Supports optional `status` filter and `search` (title ilike) query.
  */
 export async function getHostProperties(
   hostId: string,
   page = 1,
   limit = 20,
+  status = '',
+  search = '',
 ): Promise<ServiceResponse<{ properties: HostProperty[]; total: number }>> {
   const offset = (page - 1) * limit;
 
-  const { data, error, count } = await supabase
+  let query = supabase
     .from('properties')
-    .select('id, title, location, price_per_night, status, images, average_rating, review_count, created_at', {
-      count: 'exact',
-    })
+    .select(
+      'id, title, city, country, price_per_night, status, draft_status, moderation_state, images, average_rating, review_count, created_at',
+      { count: 'exact' },
+    )
     .eq('owner_id', hostId)
+    .is('deleted_at', null)
     .order('created_at', { ascending: false })
     .range(offset, offset + limit - 1);
+
+  if (status) {
+    query = query.eq('status', status);
+  }
+  if (search) {
+    query = query.ilike('title', `%${search}%`);
+  }
+
+  const { data, error, count } = await query;
 
   if (error) return { success: false, error: error.message };
 
   const propertyRows = (data ?? []) as Array<{
     id: string;
     title: string;
-    location: string;
+    city: string | null;
+    country: string | null;
     price_per_night: number;
     status: string;
+    draft_status: string | null;
+    moderation_state: string | null;
     images: string[] | null;
     average_rating: number | null;
     review_count: number | null;
@@ -157,9 +176,11 @@ export async function getHostProperties(
   const properties: HostProperty[] = propertyRows.map((p) => ({
     id: p.id,
     title: p.title,
-    location: p.location ?? '',
+    location: [p.city, p.country].filter(Boolean).join(', '),
     price_per_night: p.price_per_night ?? 0,
     status: p.status ?? 'draft',
+    draft_status: p.draft_status ?? '',
+    moderation_state: p.moderation_state ?? '',
     active_bookings: bookingsByProp[p.id]?.active ?? 0,
     total_bookings: bookingsByProp[p.id]?.total ?? 0,
     average_rating: p.average_rating ?? 0,
