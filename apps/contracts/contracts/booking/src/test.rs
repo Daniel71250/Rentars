@@ -1806,4 +1806,487 @@ mod tests {
         // Event "escrow_funded" should be emitted during fund_escrow
         assert!(true);
     }
+
+    // ─── Transition Matrix Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_transition_matrix_valid_paths() {
+        let (env, booking_cid, listing_cid, admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+        let property_id = create_property(&env, &listing_cid, &owner);
+
+        // Path 1: Pending -> Confirmed -> Completed
+        let id1 = client.create_booking(&tenant, &property_id, &1_000_u64, &1_005_u64, &100_i128);
+        client.update_status(&admin, &id1, &BookingStatus::Confirmed);
+        assert_eq!(client.get_booking(&id1).status, BookingStatus::Confirmed);
+        client.update_status(&admin, &id1, &BookingStatus::Completed);
+        assert_eq!(client.get_booking(&id1).status, BookingStatus::Completed);
+
+        // Path 2: Pending -> Cancelled
+        let id2 = client.create_booking(&tenant, &property_id, &2_000_u64, &2_005_u64, &100_i128);
+        client.update_status(&admin, &id2, &BookingStatus::Cancelled);
+        assert_eq!(client.get_booking(&id2).status, BookingStatus::Cancelled);
+
+        // Path 3: Pending -> Confirmed -> Cancelled
+        let id3 = client.create_booking(&tenant, &property_id, &3_000_u64, &3_005_u64, &100_i128);
+        client.update_status(&admin, &id3, &BookingStatus::Confirmed);
+        assert_eq!(client.get_booking(&id3).status, BookingStatus::Confirmed);
+        client.update_status(&admin, &id3, &BookingStatus::Cancelled);
+        assert_eq!(client.get_booking(&id3).status, BookingStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_transition_matrix_rejects_all_from_completed() {
+        let (env, booking_cid, listing_cid, admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+        let property_id = create_property(&env, &listing_cid, &owner);
+        let id = client.create_booking(&tenant, &property_id, &1_000_u64, &1_005_u64, &100_i128);
+
+        client.update_status(&admin, &id, &BookingStatus::Confirmed);
+        client.update_status(&admin, &id, &BookingStatus::Completed);
+
+        // Completed is terminal — no further transitions allowed
+        let _ = std::panic::catch_unwind(|| {
+            client.update_status(&admin, &id, &BookingStatus::Confirmed);
+        });
+        let _ = std::panic::catch_unwind(|| {
+            client.update_status(&admin, &id, &BookingStatus::Cancelled);
+        });
+        let _ = std::panic::catch_unwind(|| {
+            client.update_status(&admin, &id, &BookingStatus::Completed);
+        });
+
+        // State must remain Completed
+        assert_eq!(client.get_booking(&id).status, BookingStatus::Completed);
+    }
+
+    #[test]
+    fn test_transition_matrix_rejects_all_from_cancelled() {
+        let (env, booking_cid, listing_cid, admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+        let property_id = create_property(&env, &listing_cid, &owner);
+        let id = client.create_booking(&tenant, &property_id, &1_000_u64, &1_005_u64, &100_i128);
+
+        client.update_status(&admin, &id, &BookingStatus::Cancelled);
+
+        // Cancelled is terminal
+        let _ = std::panic::catch_unwind(|| {
+            client.update_status(&admin, &id, &BookingStatus::Confirmed);
+        });
+        let _ = std::panic::catch_unwind(|| {
+            client.update_status(&admin, &id, &BookingStatus::Completed);
+        });
+
+        assert_eq!(client.get_booking(&id).status, BookingStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_transition_matrix_rejects_pending_to_completed() {
+        let (env, booking_cid, listing_cid, admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+        let property_id = create_property(&env, &listing_cid, &owner);
+        let id = client.create_booking(&tenant, &property_id, &1_000_u64, &1_005_u64, &100_i128);
+
+        let _ = std::panic::catch_unwind(|| {
+            client.update_status(&admin, &id, &BookingStatus::Completed);
+        });
+        assert_eq!(client.get_booking(&id).status, BookingStatus::Pending);
+    }
+
+    #[test]
+    fn test_transition_matrix_rejects_confirmed_to_pending() {
+        let (env, booking_cid, listing_cid, admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+        let property_id = create_property(&env, &listing_cid, &owner);
+        let id = client.create_booking(&tenant, &property_id, &1_000_u64, &1_005_u64, &100_i128);
+
+        client.update_status(&admin, &id, &BookingStatus::Confirmed);
+        let _ = std::panic::catch_unwind(|| {
+            client.update_status(&admin, &id, &BookingStatus::Pending);
+        });
+        assert_eq!(client.get_booking(&id).status, BookingStatus::Confirmed);
+    }
+
+    // ─── State immutability after failed operations ───────────────────────────
+
+    #[test]
+    fn test_failed_transition_preserves_all_state() {
+        let (env, booking_cid, listing_cid, admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+        let property_id = create_property(&env, &listing_cid, &owner);
+        let id = client.create_booking(&tenant, &property_id, &1_000_u64, &1_005_u64, &100_i128);
+
+        client.update_status(&admin, &id, &BookingStatus::Confirmed);
+        let before = client.get_booking(&id);
+
+        // Invalid transition — should panic and leave state unchanged
+        let _ = std::panic::catch_unwind(|| {
+            client.update_status(&admin, &id, &BookingStatus::Completed);
+            client.update_status(&admin, &id, &BookingStatus::Confirmed);
+        });
+
+        let after = client.get_booking(&id);
+        assert_eq!(before.status, after.status);
+        assert_eq!(before.escrow_status, after.escrow_status);
+        assert_eq!(before.check_in, after.check_in);
+        assert_eq!(before.check_out, after.check_out);
+    }
+
+    #[test]
+    fn test_failed_fund_escrow_preserves_state() {
+        let (env, booking_cid, listing_cid, admin, token_address, token_admin) =
+            make_env_with_token();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+
+        let booking_id = setup_funded_booking(
+            &env,
+            &booking_cid,
+            &listing_cid,
+            &admin,
+            &token_address,
+            &token_admin,
+            &tenant,
+            &owner,
+            100_0000000_i128,
+        );
+
+        // Confirm first — now escrow is Released, can't fund again
+        client.update_status(&admin, &booking_id, &BookingStatus::Confirmed);
+        let before = client.get_booking(&booking_id);
+
+        let _ = std::panic::catch_unwind(|| {
+            client.fund_escrow(&tenant, &booking_id);
+        });
+
+        let after = client.get_booking(&booking_id);
+        assert_eq!(before.status, after.status);
+        assert_eq!(before.escrow_status, after.escrow_status);
+    }
+
+    // ─── Cross-contract failure rollback ──────────────────────────────────────
+
+    #[test]
+    fn test_cross_contract_failure_creates_no_booking() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let listing_client = PropertyListingContractClient::new(&env, &listing_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+
+        let property_id = create_property(&env, &listing_cid, &owner);
+        listing_client.update_status(&owner, &property_id, &ListingStatus::Inactive);
+
+        let before_count = client.booking_count();
+        let _ = std::panic::catch_unwind(|| {
+            client.create_booking(
+                &tenant,
+                &property_id,
+                &1_000_u64,
+                &1_007_u64,
+                &700_0000000_i128,
+            );
+        });
+
+        // No booking was created
+        assert_eq!(client.booking_count(), before_count);
+
+        // Property is still Inactive (not changed to Rented)
+        assert_eq!(
+            listing_client.get_listing(&property_id).status,
+            ListingStatus::Inactive
+        );
+    }
+
+    #[test]
+    fn test_cancelled_booking_blocks_further_transitions() {
+        let (env, booking_cid, listing_cid, admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+        let property_id = create_property(&env, &listing_cid, &owner);
+        let id = client.create_booking(&tenant, &property_id, &1_000_u64, &1_005_u64, &100_i128);
+
+        client.update_status(&admin, &id, &BookingStatus::Cancelled);
+
+        // Cannot confirm a cancelled booking
+        let _ = std::panic::catch_unwind(|| {
+            client.update_status(&admin, &id, &BookingStatus::Confirmed);
+        });
+        assert_eq!(client.get_booking(&id).status, BookingStatus::Cancelled);
+
+        // Cannot complete a cancelled booking
+        let _ = std::panic::catch_unwind(|| {
+            client.update_status(&admin, &id, &BookingStatus::Completed);
+        });
+        assert_eq!(client.get_booking(&id).status, BookingStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_fund_escrow_rejected_on_non_pending() {
+        let (env, booking_cid, listing_cid, admin, token_address, token_admin) =
+            make_env_with_token();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+
+        let booking_id = setup_funded_booking(
+            &env,
+            &booking_cid,
+            &listing_cid,
+            &admin,
+            &token_address,
+            &token_admin,
+            &tenant,
+            &owner,
+            100_0000000_i128,
+        );
+
+        // Confirm — no longer Pending
+        client.update_status(&admin, &booking_id, &BookingStatus::Confirmed);
+        let before = client.get_booking(&booking_id);
+
+        let _ = std::panic::catch_unwind(|| {
+            client.fund_escrow(&tenant, &booking_id);
+        });
+
+        let after = client.get_booking(&booking_id);
+        assert_eq!(before.escrow_status, after.escrow_status);
+    }
+
+    #[test]
+    fn test_dispute_rejected_on_completed() {
+        let (env, booking_cid, listing_cid, admin, token_address, token_admin) =
+            make_env_with_token();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+
+        let booking_id = setup_funded_booking(
+            &env,
+            &booking_cid,
+            &listing_cid,
+            &admin,
+            &token_address,
+            &token_admin,
+            &tenant,
+            &owner,
+            100_0000000_i128,
+        );
+
+        client.fund_escrow(&tenant, &booking_id);
+        client.update_status(&admin, &booking_id, &BookingStatus::Confirmed);
+        client.update_status(&admin, &booking_id, &BookingStatus::Completed);
+
+        let _ = std::panic::catch_unwind(|| {
+            client.dispute_booking(&tenant, &booking_id);
+        });
+
+        assert_eq!(client.get_booking(&booking_id).status, BookingStatus::Completed);
+    }
+
+    #[test]
+    fn test_cancel_rejected_on_disputed() {
+        let (env, booking_cid, listing_cid, admin, token_address, token_admin) =
+            make_env_with_token();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+
+        let booking_id = setup_funded_booking(
+            &env,
+            &booking_cid,
+            &listing_cid,
+            &admin,
+            &token_address,
+            &token_admin,
+            &tenant,
+            &owner,
+            100_0000000_i128,
+        );
+
+        client.fund_escrow(&tenant, &booking_id);
+        client.dispute_booking(&tenant, &booking_id);
+
+        let _ = std::panic::catch_unwind(|| {
+            client.cancel_booking(&tenant, &booking_id);
+        });
+
+        assert_eq!(client.get_booking(&booking_id).status, BookingStatus::Disputed);
+    }
+
+    // ─── Property state consistency ───────────────────────────────────────────
+
+    #[test]
+    fn test_property_state_consistency_after_booking_lifecycle() {
+        let (env, booking_cid, listing_cid, admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let listing_client = PropertyListingContractClient::new(&env, &listing_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+
+        let property_id = create_property(&env, &listing_cid, &owner);
+
+        // Property starts Active
+        assert_eq!(
+            listing_client.get_listing(&property_id).status,
+            ListingStatus::Active
+        );
+
+        // Booking marks it Rented
+        let id = client.create_booking(&tenant, &property_id, &1_000_u64, &1_005_u64, &100_i128);
+        assert_eq!(
+            listing_client.get_listing(&property_id).status,
+            ListingStatus::Rented
+        );
+
+        // Cancel booking — property stays Rented (no un-rent on cancel)
+        client.cancel_booking(&tenant, &id);
+        assert_eq!(
+            listing_client.get_listing(&property_id).status,
+            ListingStatus::Rented
+        );
+    }
+
+    // ─── Authorization matrix ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_authorization_only_admin_can_transition_status() {
+        let (env, booking_cid, listing_cid, _admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let property_id = create_property(&env, &listing_cid, &owner);
+        let id = client.create_booking(&tenant, &property_id, &1_000_u64, &1_005_u64, &100_i128);
+
+        let _ = std::panic::catch_unwind(|| {
+            client.update_status(&attacker, &id, &BookingStatus::Confirmed);
+        });
+        assert_eq!(client.get_booking(&id).status, BookingStatus::Pending);
+    }
+
+    #[test]
+    fn test_authorization_only_tenant_or_admin_can_cancel() {
+        let (env, booking_cid, listing_cid, admin) = make_env_with_listing();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let property_id = create_property(&env, &listing_cid, &owner);
+        let id = client.create_booking(&tenant, &property_id, &1_000_u64, &1_005_u64, &100_i128);
+
+        // Attacker cannot cancel
+        let _ = std::panic::catch_unwind(|| {
+            client.cancel_booking(&attacker, &id);
+        });
+        assert_eq!(client.get_booking(&id).status, BookingStatus::Pending);
+
+        // Admin can cancel
+        client.cancel_booking(&admin, &id);
+        assert_eq!(client.get_booking(&id).status, BookingStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_authorization_only_tenant_can_fund_escrow() {
+        let (env, booking_cid, listing_cid, admin, token_address, token_admin) =
+            make_env_with_token();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        let booking_id = setup_funded_booking(
+            &env,
+            &booking_cid,
+            &listing_cid,
+            &admin,
+            &token_address,
+            &token_admin,
+            &tenant,
+            &owner,
+            100_0000000_i128,
+        );
+
+        let _ = std::panic::catch_unwind(|| {
+            client.fund_escrow(&attacker, &booking_id);
+        });
+
+        assert_eq!(
+            client.get_booking(&booking_id).escrow_status,
+            EscrowStatus::NotFunded
+        );
+    }
+
+    #[test]
+    fn test_authorization_only_tenant_can_dispute() {
+        let (env, booking_cid, listing_cid, admin, token_address, token_admin) =
+            make_env_with_token();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        let booking_id = setup_funded_booking(
+            &env,
+            &booking_cid,
+            &listing_cid,
+            &admin,
+            &token_address,
+            &token_admin,
+            &tenant,
+            &owner,
+            100_0000000_i128,
+        );
+
+        client.fund_escrow(&tenant, &booking_id);
+        let _ = std::panic::catch_unwind(|| {
+            client.dispute_booking(&attacker, &booking_id);
+        });
+
+        assert_eq!(client.get_booking(&booking_id).status, BookingStatus::Pending);
+    }
+
+    #[test]
+    fn test_authorization_only_admin_can_resolve_dispute() {
+        let (env, booking_cid, listing_cid, admin, token_address, token_admin) =
+            make_env_with_token();
+        let client = BookingContractClient::new(&env, &booking_cid);
+        let owner = Address::generate(&env);
+        let tenant = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        let booking_id = setup_funded_booking(
+            &env,
+            &booking_cid,
+            &listing_cid,
+            &admin,
+            &token_address,
+            &token_admin,
+            &tenant,
+            &owner,
+            100_0000000_i128,
+        );
+
+        client.fund_escrow(&tenant, &booking_id);
+        client.dispute_booking(&tenant, &booking_id);
+        let _ = std::panic::catch_unwind(|| {
+            client.resolve_dispute(&attacker, &booking_id, &true);
+        });
+
+        assert_eq!(client.get_booking(&booking_id).status, BookingStatus::Disputed);
+    }
 }
