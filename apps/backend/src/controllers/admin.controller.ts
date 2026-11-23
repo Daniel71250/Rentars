@@ -9,11 +9,72 @@ import { changeUserRole } from '@/services/roleAssignment.service.js';
 import { ASSIGNABLE_ROLES } from '@/config/roleTransitions.js';
 import type { RequestWithId } from '@/middleware/logging.middleware.js';
 import { z } from 'zod';
+import {
+  canPerform,
+  type AdminOperation,
+} from '@/config/adminPermissions.js';
 
 function getRouteId(value: string | string[] | undefined): string | null {
   if (typeof value !== 'string' || !value.trim()) return null;
   return value;
 }
+
+/**
+ * Defense-in-depth permission gate applied inside controllers, after
+ * authentication and before any sensitive data access or mutation.
+ *
+ * The route-level `requireScope`/admin middleware is the primary gate; this
+ * re-check guarantees that even a misconfigured route cannot expose data or
+ * mutate state for an actor whose role is not in the operation's policy.
+ *
+ * Returns `true` when the actor may proceed. When denied, a 403 response is
+ * written and an audit entry is recorded with the request ID.
+ */
+async function enforceOperation(
+  req: AdminRequest,
+  res: Response,
+  operation: AdminOperation,
+): Promise<boolean> {
+  const role = req.adminRole;
+  if (canPerform(role, operation)) return true;
+
+  const requestId = (req as RequestWithId).requestId;
+
+  await auditLogger.log({
+    actorId: req.adminId,
+    action: 'admin.permission_denied',
+    resourceType: 'admin_operation',
+    resourceId: operation,
+    ip: req.ip,
+    meta: { operation, role: role ?? null, request_id: requestId ?? null },
+  });
+
+  res.status(403).json({
+    error: {
+      code: 'FORBIDDEN',
+      message: `Role '${role ?? 'unknown'}' is not permitted to perform '${operation}'.`,
+      request_id: requestId ?? null,
+    },
+  });
+  return false;
+}
+
+/** Server-side reason validation shared by user moderation actions. */
+const moderationReasonSchema = z
+  .string()
+  .trim()
+  .min(10, 'reason must be at least 10 characters')
+  .max(2000, 'reason must be at most 2000 characters');
+
+const userModerationBodySchema = z
+  .object({
+    reason: moderationReasonSchema,
+    /** Operator confirmed the documented consequences in the UI. */
+    confirmed: z.literal(true, {
+      errorMap: () => ({ message: 'confirmed must be true to apply a moderation action' }),
+    }),
+  })
+  .strict();
 
 // ─── Featured listings ────────────────────────────────────────────────────────
 
@@ -265,6 +326,8 @@ export async function getRateLimitSummary(req: Request, res: Response): Promise<
  * List all users with role, status, join date. Supports pagination.
  */
 export async function listUsers(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'users:read'))) return;
+
   const page = Math.max(1, Number(req.query.page ?? 1));
   const limit = Math.min(100, Math.max(1, Number(req.query.limit ?? 20)));
   const offset = (page - 1) * limit;
@@ -288,6 +351,8 @@ export async function listUsers(req: AdminRequest, res: Response): Promise<void>
  * User detail with booking history.
  */
 export async function getUserDetail(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'users:read'))) return;
+
   const id = getRouteId(req.params.id);
   if (!id) {
     res.status(400).json({ error: { code: 'INVALID_ID', message: 'User ID is required' } });
@@ -318,18 +383,78 @@ export async function getUserDetail(req: AdminRequest, res: Response): Promise<v
 
 /**
  * POST /api/v1/admin/users/:id/suspend
+ *
+ * Suspends a user account. Effects (documented in docs/admin-runbooks.md):
+ *   - login is blocked (status !== 'active')
+ *   - new bookings and messages are rejected
+ *   - existing bookings and payments are NOT cancelled or refunded
+ *
+ * Requires: users:suspend capability, a server-validated reason (>= 10 chars),
+ * and explicit confirmation. Self-action is rejected.
  */
 export async function suspendUser(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'users:suspend'))) return;
+
   const id = getRouteId(req.params.id);
   if (!id) {
     res.status(400).json({ error: { code: 'INVALID_ID', message: 'User ID is required' } });
     return;
   }
 
+  if (req.adminId && req.adminId === id) {
+    res.status(403).json({
+      error: { code: 'SELF_ACTION_FORBIDDEN', message: 'Operators cannot suspend their own account.' },
+    });
+    return;
+  }
+
+  const parsed = userModerationBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(422).json({
+      error: { code: 'VALIDATION_ERROR', details: parsed.error.flatten().fieldErrors },
+    });
+    return;
+  }
+
+  const { reason } = parsed.data;
+  const requestId = (req as RequestWithId).requestId;
+
+  const { data: target, error: fetchError } = await supabase
+    .from('users')
+    .select('id, role, status')
+    .eq('id', id)
+    .maybeSingle();
+
+  if (fetchError) {
+    res.status(500).json({ error: { code: 'DB_ERROR', message: fetchError.message } });
+    return;
+  }
+  if (!target) {
+    res.status(404).json({ error: { code: 'USER_NOT_FOUND', message: 'User not found' } });
+    return;
+  }
+
+  const targetRole = (target as { role: string }).role;
+  if (targetRole === 'admin' && req.adminRole !== 'administrator') {
+    res.status(403).json({
+      error: { code: 'ROLE_FORBIDDEN', message: 'Only administrators may suspend admin accounts.' },
+    });
+    return;
+  }
+
+  const previousStatus = (target as { status: string }).status;
+  if (previousStatus === 'suspended') {
+    res.status(409).json({
+      error: { code: 'ALREADY_SUSPENDED', message: 'User is already suspended.' },
+    });
+    return;
+  }
+
   const { error } = await supabase
     .from('users')
     .update({ status: 'suspended' })
-    .eq('id', id);
+    .eq('id', id)
+    .eq('status', previousStatus);
 
   if (error) {
     res.status(500).json({ error: { code: 'DB_ERROR', message: error.message } });
@@ -342,25 +467,97 @@ export async function suspendUser(req: AdminRequest, res: Response): Promise<voi
     resourceType: 'user',
     resourceId: id,
     ip: req.ip,
+    meta: {
+      reason,
+      request_id: requestId ?? null,
+      previous_status: previousStatus,
+      new_status: 'suspended',
+      reversible: true,
+    },
   });
 
-  res.json({ message: 'User suspended.' });
+  res.json({
+    message: 'User suspended.',
+    previous_status: previousStatus,
+    status: 'suspended',
+    reversible: true,
+  });
 }
 
 /**
  * POST /api/v1/admin/users/:id/activate
+ *
+ * Restores a suspended user to active status. Restoration follows policy:
+ *   - only the account status is restored
+ *   - bookings, messages, and payments are NOT retroactively changed
+ *   - funds held in escrow are not released by this action
+ *
+ * Requires: users:restore capability, a server-validated reason, and
+ * explicit confirmation. Self-action is rejected.
  */
 export async function activateUser(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'users:restore'))) return;
+
   const id = getRouteId(req.params.id);
   if (!id) {
     res.status(400).json({ error: { code: 'INVALID_ID', message: 'User ID is required' } });
     return;
   }
 
+  if (req.adminId && req.adminId === id) {
+    res.status(403).json({
+      error: { code: 'SELF_ACTION_FORBIDDEN', message: 'Operators cannot restore their own account.' },
+    });
+    return;
+  }
+
+  const parsed = userModerationBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(422).json({
+      error: { code: 'VALIDATION_ERROR', details: parsed.error.flatten().fieldErrors },
+    });
+    return;
+  }
+
+  const { reason } = parsed.data;
+  const requestId = (req as RequestWithId).requestId;
+
+  const { data: target, error: fetchError } = await supabase
+    .from('users')
+    .select('id, role, status')
+    .eq('id', id)
+    .maybeSingle();
+
+  if (fetchError) {
+    res.status(500).json({ error: { code: 'DB_ERROR', message: fetchError.message } });
+    return;
+  }
+  if (!target) {
+    res.status(404).json({ error: { code: 'USER_NOT_FOUND', message: 'User not found' } });
+    return;
+  }
+
+  const targetRole = (target as { role: string }).role;
+  if (targetRole === 'admin' && req.adminRole !== 'administrator') {
+    res.status(403).json({
+      error: { code: 'ROLE_FORBIDDEN', message: 'Only administrators may restore admin accounts.' },
+    });
+    return;
+  }
+
+  const previousStatus = (target as { status: string }).status;
+  if (previousStatus === 'active') {
+    res.status(409).json({
+      error: { code: 'ALREADY_ACTIVE', message: 'User is already active.' },
+    });
+    return;
+  }
+
   const { error } = await supabase
     .from('users')
     .update({ status: 'active' })
-    .eq('id', id);
+    .eq('id', id)
+    .eq('status', previousStatus);
 
   if (error) {
     res.status(500).json({ error: { code: 'DB_ERROR', message: error.message } });
@@ -373,9 +570,21 @@ export async function activateUser(req: AdminRequest, res: Response): Promise<vo
     resourceType: 'user',
     resourceId: id,
     ip: req.ip,
+    meta: {
+      reason,
+      request_id: requestId ?? null,
+      previous_status: previousStatus,
+      new_status: 'active',
+      funds_restored: false,
+    },
   });
 
-  res.json({ message: 'User activated.' });
+  res.json({
+    message: 'User activated.',
+    previous_status: previousStatus,
+    status: 'active',
+    funds_restored: false,
+  });
 }
 
 // ─── Property management ──────────────────────────────────────────────────────
@@ -385,6 +594,8 @@ export async function activateUser(req: AdminRequest, res: Response): Promise<vo
  * List all properties with status filter support.
  */
 export async function listAdminProperties(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'properties:read'))) return;
+
   const page = Math.max(1, Number(req.query.page ?? 1));
   const limit = Math.min(100, Math.max(1, Number(req.query.limit ?? 20)));
   const offset = (page - 1) * limit;
@@ -414,6 +625,8 @@ export async function listAdminProperties(req: AdminRequest, res: Response): Pro
  * POST /api/v1/admin/properties/:id/suspend
  */
 export async function suspendProperty(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'properties:suspend'))) return;
+
   const id = getRouteId(req.params.id);
   if (!id) {
     res.status(400).json({ error: { code: 'INVALID_ID', message: 'Property ID is required' } });
@@ -445,6 +658,8 @@ export async function suspendProperty(req: AdminRequest, res: Response): Promise
  * POST /api/v1/admin/properties/:id/activate
  */
 export async function activateProperty(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'properties:activate'))) return;
+
   const id = getRouteId(req.params.id);
   if (!id) {
     res.status(400).json({ error: { code: 'INVALID_ID', message: 'Property ID is required' } });
@@ -479,6 +694,8 @@ export async function activateProperty(req: AdminRequest, res: Response): Promis
  * List all bookings with status filter support.
  */
 export async function listAdminBookings(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'bookings:read'))) return;
+
   const page = Math.max(1, Number(req.query.page ?? 1));
   const limit = Math.min(100, Math.max(1, Number(req.query.limit ?? 20)));
   const offset = (page - 1) * limit;
@@ -510,6 +727,8 @@ export async function listAdminBookings(req: AdminRequest, res: Response): Promi
  * Read-only reconciliation history for authorized operations staff.
  */
 export async function getEscrowReconciliationHandler(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'bookings:escrow_read'))) return;
+
   const parsedId = z.string().uuid().safeParse(req.params.id);
   if (!parsedId.success) {
     res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Booking ID must be a UUID' } });
@@ -555,6 +774,8 @@ const resolveDisputeSchema = z.object({
  * List open disputes.
  */
 export async function listDisputes(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'disputes:read'))) return;
+
   const page = Math.max(1, Number(req.query.page ?? 1));
   const limit = Math.min(100, Math.max(1, Number(req.query.limit ?? 20)));
   const offset = (page - 1) * limit;
@@ -579,6 +800,8 @@ export async function listDisputes(req: AdminRequest, res: Response): Promise<vo
  * Resolve a dispute with a resolution note.
  */
 export async function resolveDispute(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'disputes:resolve'))) return;
+
   const id = getRouteId(req.params.id);
   if (!id) {
     res.status(400).json({ error: { code: 'INVALID_ID', message: 'Dispute ID is required' } });
@@ -628,6 +851,8 @@ export async function resolveDispute(req: AdminRequest, res: Response): Promise<
  * Aggregate stats + recent security events.
  */
 export async function getDashboard(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'dashboard:read'))) return;
+
   const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
 
   const [usersResult, propertiesResult, bookingsThisWeekResult, disputesResult, recentAuditResult] =
@@ -673,6 +898,8 @@ import { listAuditLogs } from '@/services/auditLog.service.js';
  * Scope required: admin:audit:read
  */
 export async function getAuditLogsHandler(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'audit:read'))) return;
+
   const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 50)));
 
   const actorId = typeof req.query.actorId === 'string' ? req.query.actorId : undefined;
@@ -721,6 +948,8 @@ const approveRefundSchema = z.object({
  * See: docs/admin-runbooks.md — "Manual Refund Approval" runbook
  */
 export async function approveRefundHandler(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'refunds:approve'))) return;
+
   const parsed = approveRefundSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: { code: 'VALIDATION_ERROR', details: parsed.error.flatten().fieldErrors } });
@@ -817,9 +1046,18 @@ const changeRoleBodySchema = z
  * `admin` flag or `actorRole` in the body cannot influence authority.
  */
 export async function changeUserRoleHandler(req: AdminRequest, res: Response): Promise<void> {
+  if (!(await enforceOperation(req, res, 'users:change_role'))) return;
+
   const id = getRouteId(req.params.id);
   if (!id || !req.adminId) {
     res.status(400).json({ error: { code: 'INVALID_ID', message: 'User ID is required' } });
+    return;
+  }
+
+  if (req.adminId === id) {
+    res.status(403).json({
+      error: { code: 'SELF_ACTION_FORBIDDEN', message: 'Operators cannot change their own role.' },
+    });
     return;
   }
 

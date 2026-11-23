@@ -134,9 +134,23 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
 
 /**
  * Returns true if the given role has the requested scope.
+ *
+ * Scopes are always matched against the explicit per-role list in
+ * ROLE_SCOPES — there is no wildcard (`admin:*`) fallback. An unknown role
+ * or an unlisted scope is denied.
  */
 export function roleHasScope(role: string, scope: AdminScope): boolean {
   const known = role as AdminRole;
   if (!(known in ROLE_SCOPES)) return false;
   return ROLE_SCOPES[known].includes(scope);
+}
+
+/**
+ * Returns the explicit, least-privilege scope list for a role.
+ * Unknown roles receive an empty list (deny by default).
+ */
+export function getScopesForRole(role: string): AdminScope[] {
+  const known = role as AdminRole;
+  if (!(known in ROLE_SCOPES)) return [];
+  return [...ROLE_SCOPES[known]];
 }

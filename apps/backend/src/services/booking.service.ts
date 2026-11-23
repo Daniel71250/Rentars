@@ -268,6 +268,76 @@ async function fetchStellarAddress(userId: string): Promise<string | null> {
   return (data as { stellar_address?: string } | null)?.stellar_address ?? null;
 }
 
+/**
+ * User moderation policy for bookings (see issue #978 / #083).
+ *
+ * Suspension effects on bookings:
+ *  - A suspended user may not create new bookings (as tenant) nor request or
+ *    accept booking modifications. Existing bookings are NOT cancelled by the
+ *    suspension itself — cancelling would trigger refund/escrow settlement,
+ *    which is a separate, deliberate moderation decision.
+ *  - Instead, active bookings held by a suspended user are flagged for admin
+ *    review (`flagged_for_review` + `review_reason`) so operators can decide
+ *    per-booking whether to cancel, resolve, or leave them in place.
+ *
+ * Restoration policy:
+ *  - Restoring a user re-enables the ability to create/modify bookings, but it
+ *    does NOT reinstate bookings that were cancelled during the suspension, and
+ *    it does NOT release or refund any escrow funds. Reversal of a suspension is
+ *    limited to access; financial and booking-state changes made while suspended
+ *    stand and must be reversed through their own audited flows.
+ */
+const SUSPENDED_BOOKING_REVIEW_REASON =
+  'Account suspended — active booking flagged for admin review';
+
+/** Booking statuses that count as "active" for suspension review purposes. */
+const ACTIVE_BOOKING_STATUSES = ['Pending', 'Confirmed', 'Disputed'] as const;
+
+/**
+ * Returns true when the given user is currently suspended. A missing profile or
+ * a lookup failure is treated as "not suspended" so a transient DB error cannot
+ * silently block every booking; the authorization layer remains authoritative.
+ */
+async function isUserSuspended(userId: string): Promise<boolean> {
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('account_status')
+    .eq('id', userId)
+    .maybeSingle();
+  if (error) return false;
+  return (data as { account_status?: string } | null)?.account_status === 'suspended';
+}
+
+/**
+ * Flag every active booking held by a suspended user for admin review. This is
+ * intentionally non-destructive: it never cancels bookings or touches escrow.
+ * Best-effort — failures are logged and never block the suspension itself.
+ */
+async function flagActiveBookingsForSuspension(userId: string): Promise<void> {
+  try {
+    const { error } = await supabase
+      .from('bookings')
+      .update({
+        flagged_for_review: true,
+        review_reason: SUSPENDED_BOOKING_REVIEW_REASON,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('tenant_id', userId)
+      .in('status', ACTIVE_BOOKING_STATUSES as unknown as string[]);
+    if (error) {
+      console.error(
+        `[BookingService] Failed to flag active bookings for suspended user=${userId}:`,
+        error,
+      );
+    }
+  } catch (e) {
+    console.error(
+      `[BookingService] Failed to flag active bookings for suspended user=${userId}:`,
+      e,
+    );
+  }
+}
+
 // ─── Service class ────────────────────────────────────────────────────────────
 
 export class BookingService {
@@ -751,6 +821,17 @@ export class BookingService {
 
     if (!Number.isFinite(guest_count) || !Number.isInteger(guest_count) || guest_count < 1) {
       return { success: false, error: 'guest_count must be at least 1' };
+    }
+
+    // Suspended tenants may not create new bookings. Existing bookings are left
+    // untouched (see SUSPENDED_BOOKING_REVIEW_REASON policy above).
+    if (await isUserSuspended(tenant_id)) {
+      return {
+        success: false,
+        error: 'Your account is suspended and cannot create new bookings',
+        statusCode: 403,
+        code: 'ACCOUNT_SUSPENDED',
+      };
     }
 
     // Require rules acknowledgement
@@ -1904,6 +1985,23 @@ export class BookingService {
     });
   }
 
+  /**
+   * Apply the booking-side effects of suspending a user (issue #978 / #083).
+   *
+   * Called by the admin moderation flow after the suspension itself has been
+   * recorded. This does NOT cancel bookings or move funds — it only flags the
+   * user's active bookings for admin review so an operator can decide what to
+   * do with each one. Restoration deliberately does not call this in reverse:
+   * see the SUSPENDED_BOOKING_REVIEW_REASON policy comment above.
+   */
+  async flagBookingsForSuspendedUser(userId: string): Promise<ServiceResponse<{ flagged: true }>> {
+    if (!userId) {
+      return { success: false, error: 'User ID is required' };
+    }
+    await flagActiveBookingsForSuspension(userId);
+    return { success: true, data: { flagged: true } };
+  }
+
   // ── Dispute ────────────────────────────────────────────────────────────────
 
   /**
@@ -2167,6 +2265,16 @@ export class BookingService {
       return { success: false, error: 'Forbidden: only the tenant can request a modification' };
     }
 
+    // Suspended tenants may not request booking modifications.
+    if (await isUserSuspended(tenantId)) {
+      return {
+        success: false,
+        error: 'Your account is suspended and cannot request booking modifications',
+        statusCode: 403,
+        code: 'ACCOUNT_SUSPENDED',
+      };
+    }
+
     if (booking.status === 'Cancelled' || booking.status === 'Completed' || booking.status === 'Disputed') {
       return {
         success: false,
@@ -2321,6 +2429,16 @@ export class BookingService {
 
     if (booking.properties.owner_id !== hostId) {
       return { success: false, error: 'Forbidden: only the host can accept a modification' };
+    }
+
+    // Suspended hosts may not accept booking modifications.
+    if (await isUserSuspended(hostId)) {
+      return {
+        success: false,
+        error: 'Your account is suspended and cannot accept booking modifications',
+        statusCode: 403,
+        code: 'ACCOUNT_SUSPENDED',
+      };
     }
 
     const { data: modificationData, error: modError } = await supabase
@@ -2497,6 +2615,16 @@ export class BookingService {
 
     if (booking.properties.owner_id !== hostId) {
       return { success: false, error: 'Forbidden: only the host can decline a modification' };
+    }
+
+    // Suspended hosts may not decline booking modifications.
+    if (await isUserSuspended(hostId)) {
+      return {
+        success: false,
+        error: 'Your account is suspended and cannot decline booking modifications',
+        statusCode: 403,
+        code: 'ACCOUNT_SUSPENDED',
+      };
     }
 
     const { data: modificationData, error: modError } = await supabase

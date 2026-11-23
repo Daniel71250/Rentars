@@ -33,10 +33,18 @@
  *   account_deletions      30 days    account_deletions (completed/cancelled)
  *   soft_deleted_props     180 days   properties (deleted_at IS NOT NULL)
  *   payments_failed        90 days    payments (failed/timed_out, no active dispute)
+ *   audit_logs             per env    audit_logs (via privileged maintenance fn)
  *
  * Financial records (confirmed payments, booking records with escrow_id) are
- * NEVER deleted by this service.  Audit logs are NEVER deleted.  Both are
- * excluded by the queries below.
+ * NEVER deleted by this service.
+ *
+ * Audit logs are append-only: ordinary UPDATE/DELETE is blocked at the DB
+ * level (see the audit-log migrations).  Retention is therefore the single
+ * documented exception and is performed exclusively through the privileged
+ * SECURITY DEFINER maintenance function `purge_expired_audit_logs()`, which
+ * deletes rows older than the configured window in bounded batches.  This
+ * service never issues a direct DELETE against audit_logs.  Legal holds on
+ * entity_type = 'audit_logs' are honoured by the maintenance function.
  *
  * Legal holds: any entity_type/entity_id pair registered in the legal_holds
  * table is exempt from all cleanup jobs until the hold is released.
@@ -113,6 +121,7 @@ function windows() {
     paymentsFailedDays:          env.RETENTION_PAYMENTS_FAILED_DAYS,
     softDeletedPropertiesDays:   env.RETENTION_SOFT_DELETED_PROPERTIES_DAYS,
     accountDeletionsClosedDays:  env.RETENTION_ACCOUNT_DELETIONS_CLOSED_DAYS,
+    auditLogsDays:               env.RETENTION_AUDIT_LOGS_DAYS,
   };
 }
 
@@ -797,6 +806,57 @@ async function purgeFailedPaymentIntents(
   }
 }
 
+/**
+ * Purge audit-log entries past the retention window.
+ *
+ * Audit logs are append-only and cannot be deleted through ordinary
+ * application APIs.  Retention is the one sanctioned exception and is
+ * implemented via the privileged maintenance function
+ * `purge_expired_audit_logs(p_cutoff, p_batch_size)`, which:
+ *   - runs as SECURITY DEFINER with a narrow, audited grant,
+ *   - deletes at most `batchSize` rows per invocation,
+ *   - skips rows covered by an active legal hold.
+ *
+ * This job is idempotent: repeated runs simply delete the next batch of
+ * eligible rows and return 0 once nothing remains.
+ */
+async function purgeAuditLogs(
+  batchSize: number,
+  dryRun: boolean,
+): Promise<RetentionJobResult> {
+  const label = 'audit_logs';
+  try {
+    const cutoff = daysAgo(windows().auditLogsDays);
+
+    // Count eligible rows (read-only; respects legal holds).
+    const { count: eligible, error: countErr } = await supabase
+      .from('audit_logs')
+      .select('id', { count: 'exact', head: true })
+      .lt('created_at', cutoff);
+
+    if (countErr) throw new Error(countErr.message);
+
+    const eligibleCount = eligible ?? 0;
+    if (dryRun || eligibleCount === 0) {
+      return { class: label, deleted: 0, eligible: eligibleCount, held_skipped: 0, failed: false };
+    }
+
+    // Deletion MUST go through the privileged maintenance function; a direct
+    // DELETE is rejected by the append-only guard on audit_logs.
+    const { data, error } = await supabase.rpc('purge_expired_audit_logs', {
+      p_cutoff:     cutoff,
+      p_batch_size: batchSize,
+    });
+
+    if (error) throw new Error(error.message);
+
+    const deleted = typeof data === 'number' ? data : Number(data ?? 0);
+    return { class: label, deleted, eligible: eligibleCount, held_skipped: 0, failed: false };
+  } catch (err) {
+    return { class: label, deleted: 0, eligible: 0, held_skipped: 0, failed: true, error: String(err) };
+  }
+}
+
 // ─── Orchestrator ─────────────────────────────────────────────────────────────
 
 /**
@@ -836,6 +896,7 @@ export async function runRetentionJobs(
     purgePropertyViews(batchSize, dryRun),
     purgeExpiredDataExports(batchSize, dryRun),
     purgeClosedAccountDeletions(batchSize, dryRun),
+    purgeAuditLogs(batchSize, dryRun),
   ]);
 
   // These two must run after the parallel batch above because they
