@@ -25,6 +25,7 @@ import { trackSearch, getSearchSuggestions, getTrendingSearches, trackSuggestion
 import { computeZeroResultSuggestions, getPriceHistogram } from '@/services/propertySearch.service.js';
 import { supabase } from '@/config/supabase.js';
 import { redactExactCoordinates, resolveLocationTier } from '@/utils/locationPrivacy.js';
+import { searchCursorAfterRow, searchFilterFingerprint, validateSearchCursor } from '@/utils/searchCursor.js';
 import type { AuthRequest } from '@/middleware/auth.middleware.js';
 
 // ─── Location-privacy helpers ─────────────────────────────────────────────────
@@ -346,11 +347,26 @@ export async function advancedSearchHandler(req: Request, res: Response): Promis
     limit: req.query.limit ? Number(req.query.limit) : 20,
   };
 
+  // Cursors are bound to the filter snapshot and sort mode. Invalid or stale
+  // cursors are a client error, never a silently different result page.
+  const cursorParam = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
+  const filterFingerprint = searchFilterFingerprint(filters as unknown as Record<string, unknown>);
+  const cursorValidation = validateSearchCursor(cursorParam, filters.sortBy, filterFingerprint);
+  if (!cursorValidation.ok) {
+    res.status(400).json({ error: cursorValidation.error });
+    return;
+  }
+
   const result = await advancedSearch(filters);
   if (!result.success) {
     res.status(500).json({ error: result.error });
     return;
   }
+
+  const lastRow = result.data.data[result.data.data.length - 1] as unknown as Record<string, unknown> | undefined;
+  const nextCursor = lastRow
+    ? searchCursorAfterRow(lastRow, filters.sortBy, filterFingerprint)
+    : null;
 
   const viewerId = (req as AuthRequest).userId;
   const { data: resultData, total, page: resultPage, limit: resultLimit, hasMore } = result.data;
@@ -372,11 +388,11 @@ export async function advancedSearchHandler(req: Request, res: Response): Promis
     if (suggestions.length > 0) {
       trackSuggestionEvent('offered', suggestions.map((s) => s.type).join(','), filters.query, viewerId).catch(() => {});
     }
-    res.json({ data: redacted, count: 0, page: filters.page, histogram: histogramResult, _suggestions: suggestions });
+    res.json({ data: redacted, count: 0, page: filters.page, nextCursor, histogram: histogramResult, _suggestions: suggestions });
     return;
   }
 
-  res.json({ data: redacted, count: redacted.length, page: filters.page, histogram: histogramResult });
+  res.json({ data: redacted, count: redacted.length, page: filters.page, nextCursor, histogram: histogramResult });
 }
 
 export async function searchSuggestionsHandler(req: Request, res: Response): Promise<void> {
