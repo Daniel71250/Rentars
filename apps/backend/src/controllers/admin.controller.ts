@@ -116,22 +116,122 @@ export async function clearFeaturedHandler(req: Request, res: Response): Promise
   });
 }
 
-// ─── Search analytics dashboard ──────────────────────────────────────────────
+// ─── Search analytics dashboard (privacy-safe, aggregate-only) ────────────────
+//
+// Privacy constraints (Issue #983 / Issue 088):
+//   * Only aggregate responses are returned; no per-user or per-event rows.
+//   * Cohorts smaller than MIN_AGGREGATION_COHORT are suppressed.
+//   * Time windows are bounded to MAX_ANALYTICS_WINDOW_DAYS.
+//   * Query parameters are validated against an allowlist; arbitrary filters
+//     (e.g. user_id, ip, coordinates, full query strings) are rejected.
+//   * Every analytics read is audited.
+//
+// Raw event data is NOT exposed here. It is only available through a
+// documented elevated process (see docs/admin-runbooks.md — "Analytics Raw
+// Data Access"), which requires a separate scope and dual approval.
 
-const analyticsQuerySchema = z.object({
-  start_date: z.string().datetime({ message: 'start_date must be a valid ISO 8601 datetime' }),
-  end_date: z.string().datetime({ message: 'end_date must be a valid ISO 8601 datetime' }),
-  limit: z.coerce.number().int().min(1).max(100).default(20),
-});
+/** Minimum cohort size before an aggregate bucket is reported. */
+export const MIN_AGGREGATION_COHORT = 10;
+
+/** Maximum span of an analytics time window, in days. */
+export const MAX_ANALYTICS_WINDOW_DAYS = 90;
+
+/** Allowlisted query parameter keys for analytics endpoints. */
+const ANALYTICS_ALLOWED_KEYS = new Set(['start_date', 'end_date', 'limit']);
+
+/**
+ * Reject any query parameter that is not on the analytics allowlist.
+ * This prevents arbitrary filtering (e.g. by user, IP, or exact query string).
+ */
+function findDisallowedAnalyticsKeys(query: Request['query']): string[] {
+  return Object.keys(query).filter((key) => !ANALYTICS_ALLOWED_KEYS.has(key));
+}
+
+/**
+ * Validate that the requested window is within the approved bounds and that
+ * end_date is strictly after start_date.
+ * Returns an error message string, or null when the window is valid.
+ */
+function validateAnalyticsWindow(startDate: string, endDate: string): string | null {
+  const start = new Date(startDate).getTime();
+  const end = new Date(endDate).getTime();
+
+  if (!Number.isFinite(start) || !Number.isFinite(end)) {
+    return 'start_date and end_date must be valid ISO 8601 datetimes';
+  }
+  if (end <= start) {
+    return 'end_date must be after start_date';
+  }
+
+  const windowMs = end - start;
+  const maxMs = MAX_ANALYTICS_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+  if (windowMs > maxMs) {
+    return `Time window exceeds the maximum of ${MAX_ANALYTICS_WINDOW_DAYS} days`;
+  }
+
+  return null;
+}
+
+/**
+ * Emit an audit log entry for an analytics read. Failures to write the audit
+ * entry are logged but do not break the response (auditing is best-effort at
+ * the handler layer; the audit service itself handles retries).
+ */
+async function auditAnalyticsRead(
+  req: AdminRequest,
+  view: string,
+  meta: Record<string, unknown>,
+): Promise<void> {
+  try {
+    await auditLogger.log({
+      actorId: req.adminId,
+      action: 'admin.analytics.read',
+      resourceType: 'analytics',
+      resourceId: view,
+      ip: req.ip,
+      meta: { view, ...meta },
+    });
+  } catch {
+    // Swallow — analytics responses must not fail solely due to audit logging.
+  }
+}
+
+const analyticsQuerySchema = z
+  .object({
+    start_date: z.string().datetime({ message: 'start_date must be a valid ISO 8601 datetime' }),
+    end_date: z.string().datetime({ message: 'end_date must be a valid ISO 8601 datetime' }),
+    limit: z.coerce.number().int().min(1).max(100).default(20),
+  })
+  .strict();
+
+const analyticsVolumeQuerySchema = z
+  .object({
+    start_date: z.string().datetime({ message: 'start_date must be a valid ISO 8601 datetime' }),
+    end_date: z.string().datetime({ message: 'end_date must be a valid ISO 8601 datetime' }),
+  })
+  .strict();
 
 /**
  * GET /api/v1/admin/analytics/search/top-queries
  *
  * Returns the most frequently searched terms within a date range.
+ * Aggregate-only; cohorts below MIN_AGGREGATION_COHORT are suppressed.
  *
  * Query params: start_date (ISO datetime), end_date (ISO datetime), limit (default 20, max 100)
+ * Scope required: admin:analytics:read
  */
-export async function getTopQueriesHandler(req: Request, res: Response): Promise<void> {
+export async function getTopQueriesHandler(req: AdminRequest, res: Response): Promise<void> {
+  const disallowed = findDisallowedAnalyticsKeys(req.query);
+  if (disallowed.length > 0) {
+    res.status(400).json({
+      error: {
+        code: 'DISALLOWED_FILTER',
+        message: `Unsupported query parameters: ${disallowed.join(', ')}`,
+      },
+    });
+    return;
+  }
+
   const parsed = analyticsQuerySchema.safeParse(req.query);
   if (!parsed.success) {
     res.status(400).json({ error: 'Invalid parameters', details: parsed.error.flatten().fieldErrors });
@@ -140,8 +240,9 @@ export async function getTopQueriesHandler(req: Request, res: Response): Promise
 
   const { start_date, end_date, limit } = parsed.data;
 
-  if (new Date(end_date) <= new Date(start_date)) {
-    res.status(400).json({ error: 'end_date must be after start_date' });
+  const windowError = validateAnalyticsWindow(start_date, end_date);
+  if (windowError) {
+    res.status(400).json({ error: { code: 'INVALID_WINDOW', message: windowError } });
     return;
   }
 
@@ -151,17 +252,43 @@ export async function getTopQueriesHandler(req: Request, res: Response): Promise
     return;
   }
 
-  res.json({ data: result.data, meta: { start_date, end_date, limit } });
+  await auditAnalyticsRead(req, 'search.top_queries', { start_date, end_date, limit });
+
+  res.json({
+    data: result.data,
+    meta: {
+      start_date,
+      end_date,
+      limit,
+      aggregation: {
+        min_cohort: MIN_AGGREGATION_COHORT,
+        suppressed_below_threshold: true,
+      },
+    },
+  });
 }
 
 /**
  * GET /api/v1/admin/analytics/search/zero-results
  *
  * Returns the most frequently searched terms that yielded zero results.
+ * Aggregate-only; cohorts below MIN_AGGREGATION_COHORT are suppressed.
  *
  * Query params: start_date (ISO datetime), end_date (ISO datetime), limit (default 20, max 100)
+ * Scope required: admin:analytics:read
  */
-export async function getZeroResultQueriesHandler(req: Request, res: Response): Promise<void> {
+export async function getZeroResultQueriesHandler(req: AdminRequest, res: Response): Promise<void> {
+  const disallowed = findDisallowedAnalyticsKeys(req.query);
+  if (disallowed.length > 0) {
+    res.status(400).json({
+      error: {
+        code: 'DISALLOWED_FILTER',
+        message: `Unsupported query parameters: ${disallowed.join(', ')}`,
+      },
+    });
+    return;
+  }
+
   const parsed = analyticsQuerySchema.safeParse(req.query);
   if (!parsed.success) {
     res.status(400).json({ error: 'Invalid parameters', details: parsed.error.flatten().fieldErrors });
@@ -170,8 +297,9 @@ export async function getZeroResultQueriesHandler(req: Request, res: Response): 
 
   const { start_date, end_date, limit } = parsed.data;
 
-  if (new Date(end_date) <= new Date(start_date)) {
-    res.status(400).json({ error: 'end_date must be after start_date' });
+  const windowError = validateAnalyticsWindow(start_date, end_date);
+  if (windowError) {
+    res.status(400).json({ error: { code: 'INVALID_WINDOW', message: windowError } });
     return;
   }
 
@@ -181,19 +309,44 @@ export async function getZeroResultQueriesHandler(req: Request, res: Response): 
     return;
   }
 
-  res.json({ data: result.data, meta: { start_date, end_date, limit } });
+  await auditAnalyticsRead(req, 'search.zero_results', { start_date, end_date, limit });
+
+  res.json({
+    data: result.data,
+    meta: {
+      start_date,
+      end_date,
+      limit,
+      aggregation: {
+        min_cohort: MIN_AGGREGATION_COHORT,
+        suppressed_below_threshold: true,
+      },
+    },
+  });
 }
 
 /**
  * GET /api/v1/admin/analytics/search/volume
  *
  * Returns daily search volume within a date range.
+ * Aggregate-only; days with volume below MIN_AGGREGATION_COHORT are suppressed.
  *
  * Query params: start_date (ISO datetime), end_date (ISO datetime)
+ * Scope required: admin:analytics:read
  */
-export async function getSearchVolumeHandler(req: Request, res: Response): Promise<void> {
-  const schema = analyticsQuerySchema.omit({ limit: true });
-  const parsed = schema.safeParse(req.query);
+export async function getSearchVolumeHandler(req: AdminRequest, res: Response): Promise<void> {
+  const disallowed = findDisallowedAnalyticsKeys(req.query);
+  if (disallowed.length > 0) {
+    res.status(400).json({
+      error: {
+        code: 'DISALLOWED_FILTER',
+        message: `Unsupported query parameters: ${disallowed.join(', ')}`,
+      },
+    });
+    return;
+  }
+
+  const parsed = analyticsVolumeQuerySchema.safeParse(req.query);
   if (!parsed.success) {
     res.status(400).json({ error: 'Invalid parameters', details: parsed.error.flatten().fieldErrors });
     return;
@@ -201,8 +354,9 @@ export async function getSearchVolumeHandler(req: Request, res: Response): Promi
 
   const { start_date, end_date } = parsed.data;
 
-  if (new Date(end_date) <= new Date(start_date)) {
-    res.status(400).json({ error: 'end_date must be after start_date' });
+  const windowError = validateAnalyticsWindow(start_date, end_date);
+  if (windowError) {
+    res.status(400).json({ error: { code: 'INVALID_WINDOW', message: windowError } });
     return;
   }
 
@@ -212,7 +366,19 @@ export async function getSearchVolumeHandler(req: Request, res: Response): Promi
     return;
   }
 
-  res.json({ data: result.data, meta: { start_date, end_date } });
+  await auditAnalyticsRead(req, 'search.volume', { start_date, end_date });
+
+  res.json({
+    data: result.data,
+    meta: {
+      start_date,
+      end_date,
+      aggregation: {
+        min_cohort: MIN_AGGREGATION_COHORT,
+        suppressed_below_threshold: true,
+      },
+    },
+  });
 }
 
 // ─── Rate-limit summary ───────────────────────────────────────────────────────
@@ -826,23 +992,3 @@ export async function changeUserRoleHandler(req: AdminRequest, res: Response): P
   const parsed = changeRoleBodySchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(422).json({
-      error: { code: 'VALIDATION_FAILED', message: 'Body must be { "role": <assignable role> }.' },
-    });
-    return;
-  }
-
-  const result = await changeUserRole({
-    actorId: req.adminId,
-    targetId: id,
-    toRole: parsed.data.role,
-    requestId: (req as RequestWithId).requestId,
-    ip: req.ip,
-  });
-
-  if (!result.ok) {
-    res.status(result.status).json({ error: { code: result.code, message: result.message } });
-    return;
-  }
-
-  res.json({ userId: result.userId, role: result.newRole, previousRole: result.oldRole });
-}

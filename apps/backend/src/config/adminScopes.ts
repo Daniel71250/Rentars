@@ -26,7 +26,8 @@
 export type AdminScope =
   // Dashboard & analytics
   | 'admin:dashboard:read'
-  | 'admin:analytics:read'
+  | 'admin:analytics:read'     // aggregate-only analytics (cohort suppression enforced)
+  | 'admin:analytics:raw'      // ELEVATED: raw event access, documented purpose required (#983)
   // User management
   | 'admin:users:read'
   | 'admin:users:suspend'      // HIGH-RISK: irreversible user impact
@@ -75,6 +76,7 @@ export const ROLE_SCOPES: Record<AdminRole, AdminScope[]> = {
   admin: [
     'admin:dashboard:read',
     'admin:analytics:read',
+    'admin:analytics:raw',
     'admin:users:read',
     'admin:users:suspend',
     'admin:users:activate',
