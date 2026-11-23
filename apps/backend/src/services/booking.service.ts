@@ -222,6 +222,10 @@ export interface CreateBookingInput {
   on_chain_property_id?: bigint;
   /** Quote token from GET /properties/:id/quote, binding total_price to the quoted stay. */
   quote_token?: string;
+  /** Stable identifier of the quote the tenant reviewed and accepted. */
+  quote_id?: string;
+  /** UTC timestamp when the tenant explicitly accepted the quote. */
+  quote_accepted_at?: string;
 }
 
 export interface RequestModificationInput {
@@ -865,6 +869,8 @@ export class BookingService {
       checkOut:   check_out,
       clientTotal: total_price,
       quoteToken:  input.quote_token,
+      quoteId:     input.quote_id,
+      quoteAcceptedAt: input.quote_accepted_at,
       guestCount:  guest_count,
     });
     if (!priceCheck.success || !priceCheck.data) {
@@ -960,7 +966,10 @@ export class BookingService {
         listing_terms_snapshot: termsSnapshot.data.terms,
         listing_revision: termsSnapshot.data.revision,
         pricing_version: priceCheck.data.quote.pricing_version ?? null,
-        pricing_snapshot: pricingSnapshotFromQuote(priceCheck.data.quote),
+        pricing_snapshot: {
+          ...pricingSnapshotFromQuote(priceCheck.data.quote),
+          quote_accepted_at: input.quote_accepted_at ?? null,
+        },
       })
       .eq('id', bookingId);
 

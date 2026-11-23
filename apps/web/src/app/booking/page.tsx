@@ -19,6 +19,9 @@ interface BookingPayload {
   checkOut: Date;
   guestCount: number;
   totalPrice: number;
+  quoteId: string;
+  quoteToken: string;
+  quoteAcceptedAt: string;
 }
 
 export default function BookingPage() {
@@ -140,6 +143,9 @@ export default function BookingPage() {
             check_out: data.checkOut.toISOString(),
             guest_count: data.guestCount,
             total_price: data.totalPrice,
+            quote_id: data.quoteId,
+            quote_token: data.quoteToken,
+            quote_accepted_at: data.quoteAcceptedAt,
             wallet_address: walletAddress,
             rules_acknowledged_at: rulesAcknowledgedAt || new Date().toISOString(),
             terms_version: termsAcceptance.termsVersion,
