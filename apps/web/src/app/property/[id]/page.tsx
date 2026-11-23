@@ -190,16 +190,20 @@ export default async function PropertyPage({
     url:         canonicalUrl,
     address: {
       '@type':          'PostalAddress',
-      streetAddress:    property.address,
+      // Street-level addresses are private: metadata is public HTML and is
+      // cached by crawlers, so only city/country may be published.
       addressLocality:  property.city || property.location,
       addressCountry:   property.country,
     },
-    ...(typeof property.latitude === 'number' && typeof property.longitude === 'number'
+    // #936: never publish exact coordinates in HTML metadata. Only the
+    // approved approximation from the public API may be emitted.
+    ...(typeof (property as Record<string, unknown>).approximate_latitude === 'number' &&
+    typeof (property as Record<string, unknown>).approximate_longitude === 'number'
       ? {
           geo: {
             '@type':    'GeoCoordinates',
-            latitude:   property.latitude,
-            longitude:  property.longitude,
+            latitude:   (property as Record<string, unknown>).approximate_latitude,
+            longitude:  (property as Record<string, unknown>).approximate_longitude,
           },
         }
       : {}),

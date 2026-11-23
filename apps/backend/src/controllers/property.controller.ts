@@ -24,7 +24,11 @@ import {
 import { trackSearch, getSearchSuggestions, getTrendingSearches, trackSuggestionEvent } from '@/services/searchAnalytics.service.js';
 import { computeZeroResultSuggestions, getPriceHistogram } from '@/services/propertySearch.service.js';
 import { supabase } from '@/config/supabase.js';
-import { redactExactCoordinates, resolveLocationTier } from '@/utils/locationPrivacy.js';
+import {
+  hostAllowsExactLocation,
+  redactPublicLocationResponse,
+  resolveLocationTier,
+} from '@/utils/locationPrivacy.js';
 import type { AuthRequest } from '@/middleware/auth.middleware.js';
 
 // ─── Location-privacy helpers ─────────────────────────────────────────────────
@@ -50,11 +54,11 @@ async function applyLocationPrivacy(
     supabase,
   );
 
-  if (tier === 'host' || tier === 'booking') {
-    return property as unknown as Record<string, unknown>;
-  }
-
-  return redactExactCoordinates(property as Property & { latitude?: number; longitude?: number }) as unknown as Record<string, unknown>;
+  return redactPublicLocationResponse(property, {
+    tier,
+    // Booking participants only see exact coordinates with explicit host opt-in.
+    hostAllowsExact: hostAllowsExactLocation(property as Property),
+  }) as unknown as Record<string, unknown>;
 }
 
 /**
@@ -63,7 +67,7 @@ async function applyLocationPrivacy(
  */
 function applyLocationPrivacyToList(properties: Property[]): Record<string, unknown>[] {
   return properties.map((p) =>
-    redactExactCoordinates(p as Property & { latitude?: number; longitude?: number }) as unknown as Record<string, unknown>,
+    redactPublicLocationResponse(p, { tier: 'public' }) as unknown as Record<string, unknown>,
   );
 }
 
@@ -361,7 +365,7 @@ export async function boundsSearchHandler(req: Request, res: Response): Promise<
 
   // Map markers are public — always redact exact coordinates.
   const redacted = result.data.data.map((p) =>
-    redactExactCoordinates(p as { id: string; latitude?: number; longitude?: number }) as unknown as Record<string, unknown>,
+    redactPublicLocationResponse(p, { tier: 'public' }) as unknown as Record<string, unknown>,
   );
 
   // Echo the exact query so callers never pair these markers with results
@@ -438,7 +442,7 @@ export async function advancedSearchHandler(req: Request, res: Response): Promis
 
   // Search results are always public — redact coordinates
   const redacted = resultData.map((p) =>
-    redactExactCoordinates(p as { id: string; latitude?: number; longitude?: number }) as unknown as Record<string, unknown>,
+    redactPublicLocationResponse(p, { tier: 'public' }) as unknown as Record<string, unknown>,
   );
 
   if (redacted.length === 0) {

@@ -1,5 +1,6 @@
 import type { Request, Response } from 'express';
 import { LocationService } from '@/services/location.service.js';
+import { redactPublicLocationResponse } from '@/utils/locationPrivacy.js';
 
 const locationService = new LocationService();
 
@@ -46,7 +47,9 @@ export async function searchNearby(req: Request, res: Response): Promise<void> {
     return;
   }
 
-  res.json(result.data);
+  // Nearby listings are a public endpoint: never expose exact residential
+  // coordinates or private address fields from LocationService.
+  res.json(redactPublicLocationResponse(result.data, { tier: 'public' }));
 }
 
 export async function getPriceComparison(req: Request, res: Response): Promise<void> {
