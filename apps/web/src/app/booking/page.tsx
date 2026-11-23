@@ -41,6 +41,13 @@ export default function BookingPage() {
   // Remembered so a failed submission can be retried without losing or
   // re-entering any of the user's input.
   const lastBookingRef = useRef<BookingPayload | null>(null);
+  // One operation key and one immutable body per booking attempt. Retries reuse
+  // both so the server's canonical request hash matches exactly.
+  const bookingOperationRef = useRef<{
+    payload: BookingPayload;
+    key: string;
+    body: Record<string, unknown>;
+  } | null>(null);
 
   // House rules state
   const [houseRules, setHouseRules] = useState<HouseRules | null>(null);
@@ -129,15 +136,11 @@ export default function BookingPage() {
       setSubmitError(null);
       lastBookingRef.current = data;
 
-      try {
-        const token = localStorage.getItem('token');
-        const response = await fetch(`${API_URL}/api/bookings`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify({
+      if (bookingOperationRef.current?.payload !== data) {
+        bookingOperationRef.current = {
+          payload: data,
+          key: crypto.randomUUID(),
+          body: {
             property_id: propertyId,
             check_in: data.checkIn.toISOString(),
             check_out: data.checkOut.toISOString(),
@@ -150,7 +153,21 @@ export default function BookingPage() {
             rules_acknowledged_at: rulesAcknowledgedAt || new Date().toISOString(),
             terms_version: termsAcceptance.termsVersion,
             terms_accepted_at: termsAcceptance.termsAcceptedAt,
-          }),
+          },
+        };
+      }
+      const operation = bookingOperationRef.current!;
+
+      try {
+        const token = localStorage.getItem('token');
+        const response = await fetch(`${API_URL}/api/bookings`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+            'Idempotency-Key': operation.key,
+          },
+          body: JSON.stringify(operation.body),
         });
 
         if (response.ok) {
