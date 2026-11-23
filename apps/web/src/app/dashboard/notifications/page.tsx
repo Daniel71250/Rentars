@@ -3,6 +3,7 @@
 import NotificationPreferences from '@/components/shared/NotificationPreferences';
 import { type AppNotification, useNotifications } from '@/hooks/useNotifications';
 import { Bell, CheckCheck, Settings, Trash2 } from 'lucide-react';
+import Link from 'next/link';
 import { useState } from 'react';
 
 const TYPE_LABELS: Record<string, string> = {
@@ -50,6 +51,12 @@ export default function NotificationsPage() {
           <Settings size={18} />
           Settings
         </button>
+        <Link
+          href="/dashboard/saved-searches"
+          className="text-sm text-blue-600 hover:underline dark:text-blue-400"
+        >
+          Saved searches
+        </Link>
       </div>
 
       {showSettings && (
