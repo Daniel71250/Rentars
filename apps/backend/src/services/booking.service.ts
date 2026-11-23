@@ -298,7 +298,7 @@ export class BookingService {
    *
    * @param extra - Additional columns to update alongside `status` (e.g. cancelled_at).
    */
-  private async transitionStatus(
+  async transitionStatus(
     bookingId: string,
     fromStatus: string,
     toStatus: string,
@@ -323,6 +323,34 @@ export class BookingService {
     }
 
     const payload: Record<string, unknown> = { status: toStatus, ...extra };
+
+    // Preferred path: one transaction updates the booking and inserts exactly
+    // one history row. A NULL result means another caller already claimed the
+    // transition, so no history is written.
+    const actorUuid =
+      typeof actorId === 'string' &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(actorId)
+        ? actorId
+        : null;
+    const rpcResult = await supabase.rpc?.('transition_booking_status_atomic', {
+      p_booking_id: bookingId,
+      p_from_status: fromStatus,
+      p_to_status: toStatus,
+      p_changed_by: actorUuid,
+      p_reason: reason ?? null,
+      p_extra: extra ?? {},
+    });
+    if (rpcResult && !rpcResult.error) {
+      if (!rpcResult.data) {
+        return {
+          success: false,
+          error: `Booking is no longer ${fromStatus.toLowerCase()}`,
+          code: 'STALE_TRANSITION',
+          statusCode: 409,
+        };
+      }
+      return { success: true, data: rpcResult.data as Booking };
+    }
 
     // Condition the write on the expected current status ("optimistic claim").
     // Without this, two concurrent callers racing on the same booking (e.g. an
@@ -1806,6 +1834,28 @@ export class BookingService {
 
     if (Object.keys(payload).length === 0) {
       return { success: false, error: 'No fields provided for update' };
+    }
+
+    // Status is never a generic mutable field: every change must go through the
+    // validated state machine so a matching history row is written atomically.
+    if (payload.status) {
+      const { data: current, error: currentError } = await supabase
+        .from('bookings')
+        .select('status')
+        .eq('id', id)
+        .maybeSingle();
+      if (currentError) return { success: false, error: currentError.message };
+      if (!current) return { success: false, error: 'Booking not found', statusCode: 404 };
+
+      const { status, ...extra } = payload;
+      return this.transitionStatus(
+        id,
+        (current as { status: string }).status,
+        status as string,
+        actor.id,
+        `Status updated by ${actor.role ?? 'admin'}`,
+        extra,
+      );
     }
 
     const { data, error } = await supabase
