@@ -741,6 +741,23 @@ rule from §7.2.1 applies to every row below.
 | D3 | The remaining staging secrets exposed to the job (`PROD_DB_HOST`, `VERIFY_DB_HOST`, `REDIS_URL`, `STELLAR_RPC_URL`, `BOOKING_CONTRACT_ID`, `TRUSTLESS_WORK_API_KEY`) are also unset; once D1/D2 are fixed these will block the DB, cache, and on-chain phases. | §6.1, §6.2, §6.3, §6.5 | Incident Commander (R: On-Call SRE) | 2026-11-30 | [#906](https://github.com/Rentars/Rentars/issues/906) | Open |
 | D4 | Preflight failure produces no `recovery_drill_*.json` artifact, so the failure cannot be triaged from the machine-readable report the issue requires. | §6.8 | Incident Commander (R: On-Call SRE) | 2026-11-30 | [#906](https://github.com/Rentars/Rentars/issues/906) | Open |
 
+#### 7.2.3 Follow-up risks — recovery drill 2026-11-06 (FAILED)
+
+The drill run on **2026-11-06** ([run
+42199060368](https://github.com/Rentars/Rentars/actions/runs/42199060368))
+failed during preflight: `scripts/recovery-drill.sh` exited with "Missing
+required env var: STAGING_API_URL" and "Missing required env var: ADMIN_JWT"
+before any phase started. The uploaded artifact contains only
+`recovery_drill_20261106_095848.log`; no JSON report was produced. The closure
+rule from §7.2.1 applies to every row below.
+
+| # | Risk / gap (from the 2026-11-06 drill) | Source (step) | Owner (A) | Due date | Tracking link | Status |
+|---|---|---|---|---|---|---|
+| D1 | `STAGING_API_URL` is empty in the drill workflow, so the script aborts before any phase runs and no phase result is recorded. | §6.1, §6.4–§6.8 | Incident Commander (R: On-Call SRE) | 2026-11-30 | [#907](https://github.com/Rentars/Rentars/issues/907), [run 42199060368](https://github.com/Rentars/Rentars/actions/runs/42199060368) | Open |
+| D2 | `ADMIN_JWT` is empty, so the authenticated phases (§6.4 sync resume, §6.5 core reads, §6.6 booking lookup, §6.7 reconciliation) cannot execute. | §6.4–§6.7 | Incident Commander (R: On-Call SRE) | 2026-11-30 | [#907](https://github.com/Rentars/Rentars/issues/907) | Open |
+| D3 | The remaining staging secrets exposed to the job (`PROD_DB_HOST`, `VERIFY_DB_HOST`, `REDIS_URL`, `STELLAR_RPC_URL`, `BOOKING_CONTRACT_ID`, `TRUSTLESS_WORK_API_KEY`) are also unset; once D1/D2 are fixed these will block the DB, cache, and on-chain phases. | §6.1, §6.2, §6.3, §6.5 | Incident Commander (R: On-Call SRE) | 2026-11-30 | [#907](https://github.com/Rentars/Rentars/issues/907) | Open |
+| D4 | Preflight failure produces no `recovery_drill_*.json` artifact, so the failure cannot be triaged from the machine-readable report the issue requires. | §6.8 | Incident Commander (R: On-Call SRE) | 2026-11-30 | [#907](https://github.com/Rentars/Rentars/issues/907) | Open |
+
 ### 7.3 Drill history
 
 | Date | Env | Commander | Result | Aggregate reads | Lookup+recon | Report |
