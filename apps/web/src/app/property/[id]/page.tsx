@@ -14,7 +14,7 @@
  */
 
 import type { Metadata } from 'next';
-import { redirect } from 'next/navigation';
+import { notFound, redirect } from 'next/navigation';
 import PropertyDetail from '@/components/features/properties/PropertyDetail';
 import type { Property } from '@/types/property';
 
@@ -121,8 +121,13 @@ export async function generateMetadata({
   const property = await resolveProperty(params.id);
   const siteUrl  = getSiteUrl();
 
+  // Draft or deleted properties must not be indexed at all.
+  if (!property || property.status === 'draft' || property.status === 'deleted') {
+    return { title: 'Property — Rentars' };
+  }
+
   // Canonical URL always uses the slug when available
-  const canonicalSlug = property?.slug ?? params.id;
+  const canonicalSlug = property.slug ?? params.id;
   const canonicalUrl  = `${siteUrl}/property/${canonicalSlug}`;
 
   const title = property
@@ -169,12 +174,8 @@ export default async function PropertyPage({
 }) {
   const property = await resolveProperty(params.id);
 
-  if (!property) {
-    return (
-      <div className="mx-auto w-full max-w-screen-sm overflow-x-hidden p-6 text-center sm:p-8">
-        Property not found
-      </div>
-    );
+  if (!property || property.status === 'draft' || property.status === 'deleted') {
+    notFound();
   }
 
   const siteUrl = getSiteUrl();
@@ -197,6 +198,16 @@ export default async function PropertyPage({
 
   const reviewCount = property.review_count ?? property.reviews?.length ?? 0;
 
+  // Private listings must not expose street address to crawlers.
+  const addressBlock = property.status === 'private'
+    ? {}
+    : {
+        '@type':          'PostalAddress',
+        streetAddress:    property.address,
+        addressLocality:  property.city || property.location,
+        addressCountry:   property.country,
+      };
+
   const ldJsonLd: Record<string, unknown> = {
     '@context': 'https://schema.org',
     '@type':    'LodgingBusiness',
@@ -204,12 +215,7 @@ export default async function PropertyPage({
     description: property.description_full || property.description || 'Accommodation on Rentars',
     image:       property.images?.[0]?.url,
     url:         canonicalUrl,
-    address: {
-      '@type':          'PostalAddress',
-      streetAddress:    property.address,
-      addressLocality:  property.city || property.location,
-      addressCountry:   property.country,
-    },
+    ...addressBlock,
     ...(typeof property.latitude === 'number' && typeof property.longitude === 'number'
       ? {
           geo: {
