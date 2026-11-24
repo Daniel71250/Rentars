@@ -141,6 +141,106 @@ export function sanitizePropertyForExport<
   return safe as Omit<T, 'latitude' | 'longitude'>;
 }
 
+/** Fields that can pinpoint a residence and must never reach public payloads. */
+const PRIVATE_ADDRESS_FIELDS = [
+  'address',
+  'street_address',
+  'streetAddress',
+  'address_line_1',
+  'address_line_2',
+  'addressLine1',
+  'addressLine2',
+  'unit',
+  'apartment',
+  'exact_address',
+  'exactAddress',
+] as const;
+
+const EXACT_COORDINATE_FIELDS = [
+  'latitude',
+  'longitude',
+  'lat',
+  'lng',
+  'exact_latitude',
+  'exact_longitude',
+] as const;
+
+/** Nested objects that can carry a second copy of the exact location. */
+const NESTED_LOCATION_FIELDS = ['location', 'geo', 'coordinates', 'position'] as const;
+
+export interface LocationRedactionOptions {
+  /** Tier resolved for this viewer. Defaults to the strictest ('public'). */
+  tier?: LocationPrecisionTier;
+  /** Host explicitly opted in to sharing exact coordinates with booking participants. */
+  hostAllowsExact?: boolean;
+}
+
+/**
+ * One response-level redaction helper for every public location payload.
+ *
+ * Applies the tier policy to the whole response body (single object or array),
+ * removes private address fields, rewrites exact coordinates to the approved
+ * approximation, and recurses into nested location objects so a payload cannot
+ * leak the same coordinates under a different key. Authorised participants only
+ * receive exact values when the host policy explicitly allows it; owners and
+ * moderators always keep exact values for management/dispute resolution.
+ */
+export function redactPublicLocationResponse<T>(
+  payload: T,
+  options: LocationRedactionOptions = {},
+): T {
+  const tier = options.tier ?? 'public';
+  const exactAllowed = tier === 'host' || (tier === 'booking' && options.hostAllowsExact === true);
+  return redactValue(payload, exactAllowed, tier, new WeakSet<object>()) as T;
+}
+
+function redactValue(
+  value: unknown,
+  exactAllowed: boolean,
+  tier: LocationPrecisionTier,
+  seen: WeakSet<object>,
+): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => redactValue(item, exactAllowed, tier, seen));
+  }
+  if (value === null || typeof value !== 'object') return value;
+  if (seen.has(value)) return value;
+  seen.add(value);
+
+  const source = value as Record<string, unknown>;
+  const result: Record<string, unknown> = {};
+  let exactLat: number | undefined;
+  let exactLng: number | undefined;
+
+  for (const [key, nested] of Object.entries(source)) {
+    if ((EXACT_COORDINATE_FIELDS as readonly string[]).includes(key)) {
+      if (typeof nested === 'number') {
+        if (key === 'latitude' || key === 'lat' || key === 'exact_latitude') exactLat = nested;
+        else exactLng = nested;
+      }
+      if (exactAllowed) result[key] = nested;
+      continue;
+    }
+    if (!exactAllowed && (PRIVATE_ADDRESS_FIELDS as readonly string[]).includes(key)) continue;
+    result[key] = (NESTED_LOCATION_FIELDS as readonly string[]).includes(key)
+      ? redactValue(nested, exactAllowed, tier, seen)
+      : nested;
+  }
+
+  if (!exactAllowed && typeof exactLat === 'number' && typeof exactLng === 'number') {
+    Object.assign(result, toApproximateLocation({ latitude: exactLat, longitude: exactLng }));
+  }
+  if (tier === 'public' && !('location_radius_m' in result) && (exactLat !== undefined || exactLng !== undefined)) {
+    result.location_radius_m = PUBLIC_LOCATION_RADIUS_M;
+  }
+  return result;
+}
+
+/** Host opt-in flag, when present on a property row. Never assumed. */
+export function hostAllowsExactLocation(property: { exact_location_public?: unknown; show_exact_location?: unknown }): boolean {
+  return property.exact_location_public === true || property.show_exact_location === true;
+}
+
 /**
  * Return the location precision tier for a viewer.
  *

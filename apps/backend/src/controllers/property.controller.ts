@@ -66,7 +66,7 @@ async function applyLocationPrivacy(
  */
 function applyLocationPrivacyToList(properties: Property[]): Record<string, unknown>[] {
   return properties.map((p) =>
-    redactExactCoordinates(p as Property & { latitude?: number; longitude?: number }) as unknown as Record<string, unknown>,
+    redactPublicLocationResponse(p, { tier: 'public' }) as unknown as Record<string, unknown>,
   );
 }
 
@@ -259,6 +259,14 @@ export async function deletePropertyHandler(req: AuthRequest, res: Response): Pr
  * Coordinates in the response are always redacted — map markers must use the
  * approximate_latitude / approximate_longitude fields from the privacy layer.
  */
+/** Maximum viewport area (square degrees) accepted by a map query. */
+const MAX_VIEWPORT_AREA_SQ_DEG = 100;
+
+/** Quantise bounds so sub-pixel pans share one cache entry / result set. */
+function quantizeBound(value: number): number {
+  return Math.round(value * 10_000) / 10_000;
+}
+
 export async function boundsSearchHandler(req: Request, res: Response): Promise<void> {
   const { north, south, east, west } = req.query;
 
@@ -275,15 +283,79 @@ export async function boundsSearchHandler(req: Request, res: Response): Promise<
     return;
   }
 
+  if (
+    parsedSouth < -90 || parsedNorth > 90 ||
+    parsedWest < -180 || parsedEast > 180 ||
+    parsedWest >= parsedEast
+  ) {
+    res.status(400).json({
+      error: 'Invalid viewport: latitude must be within [-90, 90], longitude within [-180, 180], and west must be less than east',
+    });
+    return;
+  }
   if (parsedSouth >= parsedNorth) {
     res.status(400).json({ error: 'south must be less than north' });
     return;
   }
+  if ((parsedNorth - parsedSouth) * (parsedEast - parsedWest) > MAX_VIEWPORT_AREA_SQ_DEG) {
+    res.status(400).json({ error: 'Viewport is too large — zoom in before searching this area' });
+    return;
+  }
 
-  const result = await advancedSearch({
-    bounds: { north: parsedNorth, south: parsedSouth, east: parsedEast, west: parsedWest },
+  const bounds = {
+    north: quantizeBound(parsedNorth),
+    south: quantizeBound(parsedSouth),
+    east: quantizeBound(parsedEast),
+    west: quantizeBound(parsedWest),
+  };
+
+  // Viewport queries must honour the active filters, otherwise markers and the
+  // visible list disagree whenever the user pans. These are the same validated
+  // filters accepted by /search/advanced, plus the validated bounds.
+  const rawTypes = req.query.property_types;
+  const property_types = rawTypes
+    ? (Array.isArray(rawTypes) ? (rawTypes as string[]) : [String(rawTypes)])
+    : undefined;
+  const VALID_TYPES = ['Apartment','House','Villa','Condo','Studio','Room','Townhouse','Cabin','Loft','Boat'];
+  if (property_types?.some((t) => !VALID_TYPES.includes(t))) {
+    res.status(400).json({ error: 'Invalid property_types in viewport search' });
+    return;
+  }
+  const numericFilters: Record<string, number | undefined> = {};
+  for (const key of ['min_price', 'max_price', 'bedrooms', 'min_bathrooms', 'guests'] as const) {
+    const raw = req.query[key];
+    if (raw !== undefined) {
+      const value = Number(raw);
+      if (!Number.isFinite(value) || value < 0) {
+        res.status(400).json({ error: `${key} must be a non-negative number` });
+        return;
+      }
+      numericFilters[key] = value;
+    }
+  }
+  const amenities = req.query.amenities
+    ? (Array.isArray(req.query.amenities)
+        ? (req.query.amenities as string[]).map(String)
+        : [String(req.query.amenities)])
+    : undefined;
+
+  const filters: AdvancedSearchFilters = {
+    bounds,
+    min_price: numericFilters.min_price,
+    max_price: numericFilters.max_price,
+    bedrooms: numericFilters.bedrooms,
+    min_bathrooms: numericFilters.min_bathrooms,
+    guests: numericFilters.guests,
+    property_types,
+    amenities,
+    checkIn: req.query.checkIn as string | undefined,
+    checkOut: req.query.checkOut as string | undefined,
+    sortBy: req.query.sortBy as AdvancedSearchFilters['sortBy'],
+    page: 1,
     limit: 200,
-  });
+  };
+
+  const result = await advancedSearch(filters);
 
   if (!result.success || !result.data) {
     res.status(500).json({ error: result.error ?? 'Search failed' });
@@ -292,10 +364,12 @@ export async function boundsSearchHandler(req: Request, res: Response): Promise<
 
   // Map markers are public — always redact exact coordinates.
   const redacted = result.data.data.map((p) =>
-    redactExactCoordinates(p as { id: string; latitude?: number; longitude?: number }) as unknown as Record<string, unknown>,
+    redactPublicLocationResponse(p, { tier: 'public' }) as unknown as Record<string, unknown>,
   );
 
-  res.json({ data: redacted, count: redacted.length });
+  // Echo the exact query so callers never pair these markers with results
+  // from a different viewport/filter combination.
+  res.json({ data: redacted, count: redacted.length, bounds, filters });
 }
 
 // ─── Advanced Search ──────────────────────────────────────────────────────────
@@ -382,7 +456,7 @@ export async function advancedSearchHandler(req: Request, res: Response): Promis
 
   // Search results are always public — redact coordinates
   const redacted = resultData.map((p) =>
-    redactExactCoordinates(p as { id: string; latitude?: number; longitude?: number }) as unknown as Record<string, unknown>,
+    redactPublicLocationResponse(p, { tier: 'public' }) as unknown as Record<string, unknown>,
   );
 
   if (redacted.length === 0) {

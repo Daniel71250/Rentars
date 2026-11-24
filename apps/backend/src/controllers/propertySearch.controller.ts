@@ -1,7 +1,7 @@
 import type { Request, Response } from 'express';
 import { searchPropertiesByQuery, searchPropertiesNearby } from '@/services/propertySearch.service.js';
 import type { NearbySearchParams } from '@/services/propertySearch.service.js';
-import { redactExactCoordinates } from '@/utils/locationPrivacy.js';
+import { redactPublicLocationResponse } from '@/utils/locationPrivacy.js';
 
 type FieldErrors = Record<string, string>;
 
@@ -39,7 +39,7 @@ export async function searchPropertiesEndpoint(req: Request, res: Response): Pro
   // Search results are always public — redact exact coordinates.
   const redacted = Array.isArray(result.data)
     ? result.data.map((p) =>
-        redactExactCoordinates(p as { id: string; latitude?: number; longitude?: number }) as unknown as Record<string, unknown>,
+        redactPublicLocationResponse(p, { tier: 'public' }) as unknown as Record<string, unknown>,
       )
     : result.data;
 
@@ -63,7 +63,7 @@ export async function searchNearbyEndpoint(req: Request, res: Response): Promise
   // The spatial query uses server-side exact coordinates; only the response is redacted.
   const items = Array.isArray(result.data) ? result.data : (result.data as { data?: unknown[] }).data ?? [];
   const redacted = items.map((p) =>
-    redactExactCoordinates(p as { id: string; latitude?: number; longitude?: number }) as unknown as Record<string, unknown>,
+    redactPublicLocationResponse(p, { tier: 'public' }) as unknown as Record<string, unknown>,
   );
 
   const responsePayload = Array.isArray(result.data)
