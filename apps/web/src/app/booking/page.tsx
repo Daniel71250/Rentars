@@ -10,7 +10,7 @@ import HouseRulesAcknowledgement, {
 } from '@/components/booking/HouseRulesAcknowledgement';
 import { TermsDisclosure, type TermsAcceptance } from '@/components/shared/TermsDisclosure';
 import { ErrorState } from '@/components/ui/async-states';
-import { isValidStellarAddress } from '@/lib/freighter-utils';
+import { isValidStellarAddress } from '@/lib/isValidStellarAddress';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
 
