@@ -957,6 +957,7 @@ export async function transitionPaymentStatus(
   }
 
   const eventHash = hashEventPayload(eventPayload);
+  const providerClass = providerClassFor(eventPayload);
 
   // ── Idempotency: same event hash → replay without side-effects ────────────
   if (payment.last_event_hash === eventHash) {
@@ -1011,6 +1012,10 @@ export async function transitionPaymentStatus(
     };
   }
 
+  const stopTimer = paymentWorkflowDurationSeconds.startTimer({
+    operation: 'transition',
+  });
+
   const { data, error } = await supabase
     .from('payments')
     .update(updatePayload)
@@ -1018,6 +1023,8 @@ export async function transitionPaymentStatus(
     .eq('version', payment.version) // optimistic concurrency guard
     .select()
     .single();
+
+  stopTimer();
 
   if (error || !data) {
     // Version conflict — another process transitioned first

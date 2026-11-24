@@ -5,6 +5,39 @@ import type { ServiceResponse } from './index.js';
 import { decodeCursor, buildCursorPage } from '../utils/cursor.js';
 import type { PaginatedResult } from '../types/pagination.js';
 import { executePaginatedQuery } from '../utils/pagination.js';
+import {
+  notificationWorkflowTotal,
+  notificationBacklogSize,
+} from '../metrics/index.js';
+
+/** Delivery channels tracked by the notification workflow metric. */
+type NotificationChannel = 'in_app' | 'email' | 'push';
+/** Bounded outcome vocabulary for notification delivery events. */
+type NotificationOutcome = 'enqueued' | 'sent' | 'failed' | 'suppressed';
+
+/**
+ * Record a single logical notification delivery event.
+ * Labels are bounded (channel + outcome) — never user or notification IDs.
+ */
+function recordNotificationEvent(channel: NotificationChannel, outcome: NotificationOutcome): void {
+  notificationWorkflowTotal.inc({ channel, outcome });
+}
+
+/**
+ * Refresh the notification backlog gauge from the outbox depth.
+ * Failures are swallowed — observability must never break delivery.
+ */
+async function refreshNotificationBacklog(): Promise<void> {
+  try {
+    const { count, error } = await supabase
+      .from('notification_outbox')
+      .select('id', { count: 'exact', head: true });
+    if (error) return;
+    notificationBacklogSize.set(count ?? 0);
+  } catch {
+    // Gauge refresh is best-effort
+  }
+}
 
 export interface CursorPaginatedResult<T> {
   data: T[];
@@ -344,12 +377,18 @@ export async function enqueueNotificationOutbox(
       },
       { onConflict: 'recipient_id,dedupe_key', ignoreDuplicates: true },
     );
-  if (error) return { success: false, error: error.message };
+  if (error) {
+    recordNotificationEvent('in_app', 'failed');
+    return { success: false, error: error.message };
+  }
+
+  recordNotificationEvent('in_app', 'enqueued');
 
   // Invalidate the notification cache so the next list request sees the new row.
   await invalidateNotificationCache(userId);
+  await refreshNotificationBacklog();
 
-  return { success: true, data: notification as Notification };
+  return { success: true, data: undefined };
 }
 
 export async function getNotifications(
