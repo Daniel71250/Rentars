@@ -57,6 +57,36 @@ const envSchema = z.object({
   // ── Redis (optional) ───────────────────────────────────────────────────────
   REDIS_URL: z.string().url().optional(),
 
+  // ── Trusted proxy topology ─────────────────────────────────────────────────
+  // Number of reverse-proxy hops in front of the app that are trusted to set
+  // X-Forwarded-For.  Express' `trust proxy` is configured from this value so
+  // the client IP is derived only from the trusted edge, never from
+  // client-supplied forwarding headers.  Default: 0 (no proxy — use the socket
+  // address).  Must be a non-negative integer.
+  TRUSTED_PROXY_HOPS: z
+    .string()
+    .default('0')
+    .transform((v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 0) {
+        throw new Error('TRUSTED_PROXY_HOPS must be a non-negative integer');
+      }
+      return n;
+    }),
+
+  // Optional comma-separated list of trusted proxy CIDRs / IPs.  When set,
+  // only requests arriving from these addresses may contribute to the
+  // forwarded-for chain.  Example: "10.0.0.0/8,192.168.0.0/16"
+  TRUSTED_PROXY_CIDRS: z
+    .string()
+    .optional()
+    .transform((v) =>
+      (v ?? '')
+        .split(',')
+        .map((c) => c.trim())
+        .filter(Boolean),
+    ),
+
   // ── Stellar / Soroban ─────────────────────────────────────────────────────
   // The active network is the single source of truth for the network
   // passphrase, RPC endpoint and contract IDs.  The passphrase is derived
@@ -422,6 +452,19 @@ const envSchema = z.object({
         message: `Production CORS origin must use https:// (got '${origin}')`,
       });
     }
+  }
+
+  // Production deployments sit behind at least one proxy (load balancer /
+  // ingress).  Running with zero trusted hops there would key rate limits on
+  // the proxy's address, grouping every client together — require an explicit
+  // topology instead of silently falling back to the default.
+  if (!process.env.TRUSTED_PROXY_HOPS?.trim() && value.TRUSTED_PROXY_CIDRS.length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['TRUSTED_PROXY_HOPS'],
+      message:
+        'TRUSTED_PROXY_HOPS (or TRUSTED_PROXY_CIDRS) must be set explicitly in production so client IPs are derived from trusted hops only',
+    });
   }
 });
 

@@ -37,6 +37,10 @@ import {
   type EscrowOperationType,
 } from './escrowOperation.service.js';
 import type { ServiceResponse } from './index.js';
+import {
+  paymentWorkflowTotal,
+  paymentWorkflowDurationSeconds,
+} from '@/observability/metrics.js';
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -269,34 +273,46 @@ export async function verifyAndProcessCallback(
   webhookSecret: string,
   expectedProviderId: string,
 ): Promise<CallbackVerificationResult> {
+  const startedAt = process.hrtime.bigint();
+
+  // Emit exactly one outcome counter + one duration observation per handled
+  // callback, regardless of which return path is taken. Labels are bounded
+  // (operation/outcome only) — never eventId, bookingId or txHash.
+  const finish = (result: CallbackVerificationResult): CallbackVerificationResult => {
+    const outcome = mapOutcomeLabel(result.status);
+    paymentWorkflowTotal.inc({ operation: 'callback', outcome });
+    const elapsedSeconds = Number(process.hrtime.bigint() - startedAt) / 1e9;
+    paymentWorkflowDurationSeconds.observe({ operation: 'callback' }, elapsedSeconds);
+    return result;
+  };
 
   // ── 1. Signature presence ────────────────────────────────────────────────
   if (!signatureHeader) {
-    return {
+    return finish({
       status: 'invalid_signature',
       httpStatus: 401,
       message: 'Missing signature header',
-    };
+    });
   }
 
   // ── 2. HMAC signature verification (constant time) ───────────────────────
   const expected = computeHmac(rawBody, webhookSecret);
   if (!safeCompare(signatureHeader, expected)) {
-    return {
+    return finish({
       status: 'invalid_signature',
       httpStatus: 401,
       message: 'Signature verification failed',
-    };
+    });
   }
 
   // ── 3. Payload schema validation ─────────────────────────────────────────
   const parseResult = callbackBodySchema.safeParse(parsedBody);
   if (!parseResult.success) {
-    return {
+    return finish({
       status: 'invalid_payload',
       httpStatus: 400,
       message: 'Malformed callback payload',
-    };
+    });
   }
 
   const body = parseResult.data;
@@ -320,7 +336,7 @@ export async function verifyAndProcessCallback(
       status: 'invalid_timestamp',
       httpStatus: 400,
       message: 'Event timestamp outside acceptable window',
-    };
+    });
   }
 
   // ── 5. Provider account identity check ───────────────────────────────────
@@ -334,7 +350,7 @@ export async function verifyAndProcessCallback(
       status: 'mismatch',
       httpStatus: 422,
       message: 'Provider account identity mismatch',
-    };
+    });
   }
 
   // ── 6. Replay detection ───────────────────────────────────────────────────
@@ -346,7 +362,7 @@ export async function verifyAndProcessCallback(
       status: 'replayed',
       httpStatus: 200,
       message: 'Event already processed',
-    };
+    });
   }
 
   // ── 7. Load payment and cross-reference booking + amount ─────────────────
@@ -359,7 +375,7 @@ export async function verifyAndProcessCallback(
       status: 'mismatch',
       httpStatus: 422,
       message: 'Booking not found',
-    };
+    });
   }
 
   const incomingStroops = BigInt(body.amountStroops);
@@ -378,7 +394,7 @@ export async function verifyAndProcessCallback(
       status: 'quarantined',
       httpStatus: 503,
       message: 'Booking verification is temporarily unavailable; retry the event',
-    };
+    });
   }
 
   let bookingAmountStroops: bigint | null = null;
@@ -419,7 +435,7 @@ export async function verifyAndProcessCallback(
       status: 'mismatch',
       httpStatus: 422,
       message: 'Amount mismatch — payment under review',
-    };
+    });
   }
 
   // ── 8. Map provider status and append to the canonical ledger ─────────────
@@ -470,11 +486,11 @@ export async function verifyAndProcessCallback(
     });
     // Still return 200 to the provider (we received it fine; our internal
     // state diverged, which is a separate alert path).
-    return {
+    return finish({
       status: 'quarantined',
       httpStatus: 200,
       message: 'Event received; payment under review',
-    };
+    });
   }
 
   const transition = transitionResult.data;
@@ -487,7 +503,7 @@ export async function verifyAndProcessCallback(
       status: 'quarantined',
       httpStatus: 200,
       message: 'Event received; payment under review',
-    };
+    });
   }
 
   // ── 9. Reconcile any escrow operation this callback settles ───────────────
@@ -508,7 +524,7 @@ export async function verifyAndProcessCallback(
       status: 'quarantined',
       httpStatus: 200,
       message: 'Event received; payment under review',
-    };
+    });
   }
 
   logCallback('info', replayed ? 'duplicate callback acknowledged' : 'callback acknowledged', {
@@ -521,7 +537,32 @@ export async function verifyAndProcessCallback(
     status: replayed ? 'replayed' : 'acknowledged',
     httpStatus: 200,
     message: replayed ? 'Event already processed' : 'Event acknowledged',
-  };
+  });
+}
+
+/**
+ * Collapse the internal verification status into the bounded set of
+ * `outcome` label values used by payment_workflow_total. Keeps cardinality
+ * fixed so dashboards and alerts stay stable.
+ */
+function mapOutcomeLabel(
+  status: CallbackVerificationStatus,
+): 'acknowledged' | 'replayed' | 'mismatch' | 'quarantined' | 'rejected' {
+  switch (status) {
+    case 'acknowledged':
+      return 'acknowledged';
+    case 'replayed':
+      return 'replayed';
+    case 'mismatch':
+      return 'mismatch';
+    case 'quarantined':
+      return 'quarantined';
+    case 'invalid_signature':
+    case 'invalid_timestamp':
+    case 'invalid_payload':
+    default:
+      return 'rejected';
+  }
 }
 
 // ─── HTTP handler helper ──────────────────────────────────────────────────────

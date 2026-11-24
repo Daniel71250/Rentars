@@ -33,10 +33,13 @@ export default function HostDashboard() {
   const {
     summary,
     properties,
+    totalProperties,
     isLoadingSummary,
     isLoadingProperties,
     summaryError,
     propertiesError,
+    propertiesPage,
+    propertiesLimit,
     refetchSummary,
     refetchProperties,
     updatePropertyStatus,
@@ -208,6 +211,9 @@ export default function HostDashboard() {
           ) : (
             <HostPropertiesTable
               properties={properties}
+              total={totalProperties}
+              page={propertiesPage}
+              totalPages={inventoryTotalPages}
               onStatusChange={updatePropertyStatus}
               getBookingActions={getActionsForBooking}
               getBookingUnavailableReason={getUnavailableReason}

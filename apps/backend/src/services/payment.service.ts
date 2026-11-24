@@ -146,6 +146,12 @@ export interface CreatePaymentIntentParams {
   sourceAccount?: string;
   metadata?: Record<string, unknown>;
   /**
+   * Whether the tenant account is currently suspended (admin moderation).
+   * Suspended tenants may not initiate new payment intents. Existing payments
+   * and escrow are never mutated by suspension (see policy below).
+   */
+  tenantSuspended?: boolean;
+  /**
    * Conversion details captured at quote time. When provided, the original
    * currency amount, converted amount, rate source and rate timestamp are
    * persisted alongside the payment intent for audit and disclosure.
@@ -715,10 +721,27 @@ export function deriveStatusFromEvents(events: ReadonlyArray<PaymentEvent>): Pay
 // ─── Service functions ────────────────────────────────────────────────────────
 
 /**
+ * Account-suspension policy for payments (issue #978).
+ *
+ * Suspension is a *reversible access* control, not a financial action:
+ *
+ *  - Suspension NEVER mutates an existing payment's status, amount, escrow or
+ *    transaction hash. Escrow is never released or refunded by suspension.
+ *  - Suspended tenants may not initiate NEW payment intents (guard below).
+ *  - Payments already `submitted`/`confirmed` continue to settle normally so
+ *    counterparties are not harmed by a moderation action.
+ *  - Restoration re-enables new intents only. It does not re-open, re-fund or
+ *    otherwise restore access to funds/escrow that policy has already moved
+ *    (e.g. refunded or failed payments stay terminal).
+ */
+export const SUSPENDED_TENANT_PAYMENT_ERROR =
+  'Tenant account is suspended; new payments cannot be initiated';
+
+/**
  * Create a new payment intent in `pending` state.
  *
  * @returns The newly created Payment record.
- * @throws  On database error.
+ * @throws  On database error, or when the tenant is suspended.
  */
 export async function createPaymentIntent(
   params: CreatePaymentIntentParams,
@@ -731,7 +754,24 @@ export async function createPaymentIntent(
     escrowId,
     metadata,
     conversion,
+    tenantSuspended,
   } = params;
+
+  // ── Suspension guard: block NEW intents only; never touch existing state ──
+  if (tenantSuspended) {
+    await auditLogger.log({
+      actorId: tenantId,
+      action: 'payment.failed',
+      resourceType: 'payment',
+      resourceId: bookingId,
+      meta: {
+        reason: 'tenant_suspended',
+        bookingId,
+        correlationId: (metadata?.correlationId as string | undefined) ?? null,
+      },
+    });
+    throw new Error(SUSPENDED_TENANT_PAYMENT_ERROR);
+  }
 
   // ── Validate precision and conversion consistency (integer minor units) ──
   if (amountStroops <= 0n) {
@@ -880,6 +920,11 @@ export async function bindPaymentNetwork(
  * Record a submitted transaction hash. Idempotent: if a hash is already
  * recorded, the existing hash is returned and no duplicate broadcast is
  * implied. Callers must re-poll the existing hash rather than re-submitting.
+ *
+ * Suspension policy: recording a hash for an already-created intent is a
+ * settlement step, not a new payment, so it is permitted even if the tenant
+ * was suspended after the intent was created. Suspension never blocks or
+ * reverses settlement of in-flight payments.
  */
 export async function recordSubmittedTx(
   paymentId: string,
@@ -957,6 +1002,7 @@ export async function transitionPaymentStatus(
   }
 
   const eventHash = hashEventPayload(eventPayload);
+  const providerClass = providerClassFor(eventPayload);
 
   // ── Idempotency: same event hash → replay without side-effects ────────────
   if (payment.last_event_hash === eventHash) {
@@ -1011,6 +1057,10 @@ export async function transitionPaymentStatus(
     };
   }
 
+  const stopTimer = paymentWorkflowDurationSeconds.startTimer({
+    operation: 'transition',
+  });
+
   const { data, error } = await supabase
     .from('payments')
     .update(updatePayload)
@@ -1018,6 +1068,8 @@ export async function transitionPaymentStatus(
     .eq('version', payment.version) // optimistic concurrency guard
     .select()
     .single();
+
+  stopTimer();
 
   if (error || !data) {
     // Version conflict — another process transitioned first
@@ -1136,6 +1188,9 @@ export async function getPaymentByBookingId(bookingId: string): Promise<Payment 
  * via compareMinorUnits() — binary floating-point values are never used, so
  * rounding can never silently change the amount transferred.
  *
+ * Suspension policy: reconciliation is read-only and always permitted; it
+ * never releases escrow or restores funds on behalf of a suspended tenant.
+ *
  * @param paymentId       - UUID of the payment to reconcile.
  * @param reportedStroops - Amount reported by the provider/ledger, in stroops.
  * @returns Whether the amounts match, plus the canonical payment record.
@@ -1178,6 +1233,30 @@ export async function reconcilePaymentAmount(
  */
 export function toStroops(usdcAmount: string): bigint {
   return amountUsdcToStroops(usdcAmount);
+}
+
+/**
+ * Describe the payment-side effects of suspending or restoring a user, so the
+ * admin UI can explain consequences before applying a moderation action.
+ *
+ * This is a pure, read-only helper: it never mutates payments or escrow.
+ */
+export function describeSuspensionPaymentEffects(): {
+  onSuspend: string[];
+  onRestore: string[];
+} {
+  return {
+    onSuspend: [
+      'New payment intents are blocked for the suspended tenant.',
+      'Existing payments keep their current status; escrow is not released or refunded.',
+      'In-flight submitted/confirmed payments continue to settle normally.',
+    ],
+    onRestore: [
+      'New payment intents are permitted again.',
+      'Previously refunded or failed payments remain terminal; funds are not restored.',
+      'Escrow state is unchanged by restoration.',
+    ],
+  };
 }
 
 // ─── Row mapping ──────────────────────────────────────────────────────────────

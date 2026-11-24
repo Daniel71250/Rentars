@@ -41,6 +41,7 @@
 
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
+import { metrics } from '@/observability/metrics.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -389,6 +390,9 @@ export async function loadCursor(
  */
 export function measureLag(cursorKey: string, cursorValue: bigint, latestOnChain: bigint): LagReport {
     const lag = latestOnChain > cursorValue ? latestOnChain - cursorValue : 0n;
+    // Expose lag as a gauge.  `cursorKey` is a bounded worker identifier
+    // (e.g. "booking_sync"), never a user/booking/transaction ID.
+    metrics.ledgerSyncLagSeconds.set({ worker: cursorKey }, Number(lag));
     return { cursor_key: cursorKey, cursor_value: cursorValue, latest_on_chain: latestOnChain, lag };
 }
 
@@ -504,15 +508,18 @@ export async function processEventOnce(
         operationId,
     });
     if (!inboxResult.success) {
+        finish('failed');
         return { success: false, error: inboxResult.error };
     }
 
     // 2. Check if already projected (covers restarts that skip the inbox insert)
     const projectedResult = await isEventProjected(eventKey);
     if (!projectedResult.success) {
+        finish('failed');
         return { success: false, error: projectedResult.error };
     }
     if (projectedResult.data) {
+        finish('duplicate');
         return { success: true, data: { outcome: 'skipped' } };
     }
 
@@ -543,12 +550,14 @@ export async function processEventOnce(
             );
         }
 
+        finish('projected');
         return { success: true, data: { outcome: 'projected' } };
     } catch (err) {
         const message = (err as Error).message;
         const failureResult = await recordEventAttemptFailure(eventKey, message);
 
         if (!failureResult.success) {
+            finish('failed');
             return { success: false, error: failureResult.error };
         }
 

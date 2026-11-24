@@ -10,7 +10,7 @@ import HouseRulesAcknowledgement, {
 } from '@/components/booking/HouseRulesAcknowledgement';
 import { TermsDisclosure, type TermsAcceptance } from '@/components/shared/TermsDisclosure';
 import { ErrorState } from '@/components/ui/async-states';
-import { isValidStellarAddress } from '@/lib/freighter-utils';
+import { isValidStellarAddress } from '@/lib/isValidStellarAddress';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
 
@@ -19,6 +19,9 @@ interface BookingPayload {
   checkOut: Date;
   guestCount: number;
   totalPrice: number;
+  quoteId: string;
+  quoteToken: string;
+  quoteAcceptedAt: string;
 }
 
 export default function BookingPage() {
@@ -38,6 +41,13 @@ export default function BookingPage() {
   // Remembered so a failed submission can be retried without losing or
   // re-entering any of the user's input.
   const lastBookingRef = useRef<BookingPayload | null>(null);
+  // One operation key and one immutable body per booking attempt. Retries reuse
+  // both so the server's canonical request hash matches exactly.
+  const bookingOperationRef = useRef<{
+    payload: BookingPayload;
+    key: string;
+    body: Record<string, unknown>;
+  } | null>(null);
 
   // House rules state
   const [houseRules, setHouseRules] = useState<HouseRules | null>(null);
@@ -126,6 +136,28 @@ export default function BookingPage() {
       setSubmitError(null);
       lastBookingRef.current = data;
 
+      if (bookingOperationRef.current?.payload !== data) {
+        bookingOperationRef.current = {
+          payload: data,
+          key: crypto.randomUUID(),
+          body: {
+            property_id: propertyId,
+            check_in: data.checkIn.toISOString(),
+            check_out: data.checkOut.toISOString(),
+            guest_count: data.guestCount,
+            total_price: data.totalPrice,
+            quote_id: data.quoteId,
+            quote_token: data.quoteToken,
+            quote_accepted_at: data.quoteAcceptedAt,
+            wallet_address: walletAddress,
+            rules_acknowledged_at: rulesAcknowledgedAt || new Date().toISOString(),
+            terms_version: termsAcceptance.termsVersion,
+            terms_accepted_at: termsAcceptance.termsAcceptedAt,
+          },
+        };
+      }
+      const operation = bookingOperationRef.current!;
+
       try {
         const token = localStorage.getItem('token');
         const response = await fetch(`${API_URL}/api/bookings`, {
@@ -133,18 +165,9 @@ export default function BookingPage() {
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${token}`,
+            'Idempotency-Key': operation.key,
           },
-          body: JSON.stringify({
-            property_id: propertyId,
-            check_in: data.checkIn.toISOString(),
-            check_out: data.checkOut.toISOString(),
-            guest_count: data.guestCount,
-            total_price: data.totalPrice,
-            wallet_address: walletAddress,
-            rules_acknowledged_at: rulesAcknowledgedAt || new Date().toISOString(),
-            terms_version: termsAcceptance.termsVersion,
-            terms_accepted_at: termsAcceptance.termsAcceptedAt,
-          }),
+          body: JSON.stringify(operation.body),
         });
 
         if (response.ok) {

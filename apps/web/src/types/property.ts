@@ -33,6 +33,11 @@ export interface Property {
   // Human-readable URL slug (migration 00024).
   // Format: <title>-<city>-<6-char-id-prefix>
   slug?: string;
+
+  // Listing lifecycle status. Draft and deleted listings must never be
+  // indexed or exposed through public metadata/sitemap. Private listings
+  // hide street-address fields from crawlers.
+  status?: 'draft' | 'active' | 'deleted' | 'private';
 }
 
 /**

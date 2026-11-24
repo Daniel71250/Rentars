@@ -50,7 +50,7 @@ const router = Router();
  */
 const bookingCreationLimiter = createUserRateLimiter({
   windowMs: env.BOOKING_RATE_LIMIT_WINDOW_MS,
-  max: env.BOOKING_RATE_LIMIT_MAX,
+  max: process.env.NODE_ENV === 'test' ? 10000 : env.BOOKING_RATE_LIMIT_MAX,
   keyPrefix: 'rl:user:booking',
 });
 

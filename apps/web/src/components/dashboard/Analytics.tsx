@@ -1,6 +1,29 @@
 'use client';
 
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import dynamic from 'next/dynamic';
+
+// Lazy-load recharts only when rendering the chart — keeps the initial
+// dashboard bundle small since recharts is a heavy dependency.
+const RechartsBarChart = dynamic(
+  async () => {
+    const mod = await import('./LazyChart');
+    return mod.LazyChart;
+  },
+  {
+    ssr: false,
+    loading: () => (
+      <div
+        role="status"
+        aria-live="polite"
+        aria-busy="true"
+        className="flex flex-col items-center justify-center h-[300px] gap-3"
+      >
+        <div className="h-8 w-8 animate-spin rounded-full border-2 border-gray-300 border-t-blue-500" aria-hidden="true" />
+        <span className="text-sm text-gray-500 dark:text-gray-400">Loading spending chart…</span>
+      </div>
+    ),
+  }
+);
 
 interface AnalyticsProps {
   data?: Array<{
@@ -69,18 +92,7 @@ export default function Analytics({ data, loading = false, error = null, onRetry
       );
     }
 
-    return (
-      <ResponsiveContainer width="100%" height={300}>
-        <BarChart data={data}>
-          <CartesianGrid strokeDasharray="3 3" />
-          <XAxis dataKey="month" />
-          <YAxis />
-          <Tooltip />
-          <Legend />
-          <Bar dataKey="spent" fill="#3b82f6" name="USDC Spent" />
-        </BarChart>
-      </ResponsiveContainer>
-    );
+    return <RechartsBarChart data={data} />;
   };
 
   return (

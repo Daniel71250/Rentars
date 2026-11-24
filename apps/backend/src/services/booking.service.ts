@@ -38,8 +38,11 @@ import type { CursorPaginatedResult } from './notification.service.js';
 import type { ServiceResponse } from './index.js';
 import {
   incCounter,
+  observeHistogram,
   bookingsCreatedTotal,
   escrowFailuresTotal,
+  bookingWorkflowTotal,
+  bookingWorkflowDurationSeconds,
 } from '@/middleware/metrics.middleware.js';
 import { checkDateRangeAvailability } from './availability.service.js';
 import { calculateRangePrice, pricingSnapshotFromQuote } from './pricing.service.js';
@@ -353,6 +356,10 @@ export interface CreateBookingInput {
   on_chain_property_id?: bigint;
   /** Quote token from GET /properties/:id/quote, binding total_price to the quoted stay. */
   quote_token?: string;
+  /** Stable identifier of the quote the tenant reviewed and accepted. */
+  quote_id?: string;
+  /** UTC timestamp when the tenant explicitly accepted the quote. */
+  quote_accepted_at?: string;
 }
 
 export interface RequestModificationInput {
@@ -399,6 +406,76 @@ async function fetchStellarAddress(userId: string): Promise<string | null> {
   return (data as { stellar_address?: string } | null)?.stellar_address ?? null;
 }
 
+/**
+ * User moderation policy for bookings (see issue #978 / #083).
+ *
+ * Suspension effects on bookings:
+ *  - A suspended user may not create new bookings (as tenant) nor request or
+ *    accept booking modifications. Existing bookings are NOT cancelled by the
+ *    suspension itself — cancelling would trigger refund/escrow settlement,
+ *    which is a separate, deliberate moderation decision.
+ *  - Instead, active bookings held by a suspended user are flagged for admin
+ *    review (`flagged_for_review` + `review_reason`) so operators can decide
+ *    per-booking whether to cancel, resolve, or leave them in place.
+ *
+ * Restoration policy:
+ *  - Restoring a user re-enables the ability to create/modify bookings, but it
+ *    does NOT reinstate bookings that were cancelled during the suspension, and
+ *    it does NOT release or refund any escrow funds. Reversal of a suspension is
+ *    limited to access; financial and booking-state changes made while suspended
+ *    stand and must be reversed through their own audited flows.
+ */
+const SUSPENDED_BOOKING_REVIEW_REASON =
+  'Account suspended — active booking flagged for admin review';
+
+/** Booking statuses that count as "active" for suspension review purposes. */
+const ACTIVE_BOOKING_STATUSES = ['Pending', 'Confirmed', 'Disputed'] as const;
+
+/**
+ * Returns true when the given user is currently suspended. A missing profile or
+ * a lookup failure is treated as "not suspended" so a transient DB error cannot
+ * silently block every booking; the authorization layer remains authoritative.
+ */
+async function isUserSuspended(userId: string): Promise<boolean> {
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('account_status')
+    .eq('id', userId)
+    .maybeSingle();
+  if (error) return false;
+  return (data as { account_status?: string } | null)?.account_status === 'suspended';
+}
+
+/**
+ * Flag every active booking held by a suspended user for admin review. This is
+ * intentionally non-destructive: it never cancels bookings or touches escrow.
+ * Best-effort — failures are logged and never block the suspension itself.
+ */
+async function flagActiveBookingsForSuspension(userId: string): Promise<void> {
+  try {
+    const { error } = await supabase
+      .from('bookings')
+      .update({
+        flagged_for_review: true,
+        review_reason: SUSPENDED_BOOKING_REVIEW_REASON,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('tenant_id', userId)
+      .in('status', ACTIVE_BOOKING_STATUSES as unknown as string[]);
+    if (error) {
+      console.error(
+        `[BookingService] Failed to flag active bookings for suspended user=${userId}:`,
+        error,
+      );
+    }
+  } catch (e) {
+    console.error(
+      `[BookingService] Failed to flag active bookings for suspended user=${userId}:`,
+      e,
+    );
+  }
+}
+
 // ─── Service class ────────────────────────────────────────────────────────────
 
 export class BookingService {
@@ -425,7 +502,7 @@ export class BookingService {
    *
    * @param extra - Additional columns to update alongside `status` (e.g. cancelled_at).
    */
-  private async transitionStatus(
+  async transitionStatus(
     bookingId: string,
     fromStatus: string,
     toStatus: string,
@@ -450,6 +527,34 @@ export class BookingService {
     }
 
     const payload: Record<string, unknown> = { status: toStatus, ...extra };
+
+    // Preferred path: one transaction updates the booking and inserts exactly
+    // one history row. A NULL result means another caller already claimed the
+    // transition, so no history is written.
+    const actorUuid =
+      typeof actorId === 'string' &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(actorId)
+        ? actorId
+        : null;
+    const rpcResult = await supabase.rpc?.('transition_booking_status_atomic', {
+      p_booking_id: bookingId,
+      p_from_status: fromStatus,
+      p_to_status: toStatus,
+      p_changed_by: actorUuid,
+      p_reason: reason ?? null,
+      p_extra: extra ?? {},
+    });
+    if (rpcResult && !rpcResult.error) {
+      if (!rpcResult.data) {
+        return {
+          success: false,
+          error: `Booking is no longer ${fromStatus.toLowerCase()}`,
+          code: 'STALE_TRANSITION',
+          statusCode: 409,
+        };
+      }
+      return { success: true, data: rpcResult.data as Booking };
+    }
 
     // Condition the write on the expected current status ("optimistic claim").
     // Without this, two concurrent callers racing on the same booking (e.g. an
@@ -867,6 +972,19 @@ export class BookingService {
    *   7. Create on-chain booking record
    */
   async createBooking(input: CreateBookingInput): Promise<ServiceResponse<Booking>> {
+    const startedAt = process.hrtime.bigint();
+    const result = await this.createBookingInner(input);
+    observeHistogram(bookingWorkflowDurationSeconds, Number(process.hrtime.bigint() - startedAt) / 1e9, {
+      stage: 'create',
+    });
+    incCounter(bookingWorkflowTotal, {
+      stage: 'create',
+      outcome: result.success ? 'success' : 'failure',
+    });
+    return result;
+  }
+
+  private async createBookingInner(input: CreateBookingInput): Promise<ServiceResponse<Booking>> {
     const { property_id, tenant_id, check_in, check_out, guest_count, total_price, rules_acknowledged_at, terms_version, terms_accepted_at } = input;
 
     if (!property_id || !tenant_id || !check_in || !check_out) {
@@ -890,6 +1008,17 @@ export class BookingService {
         statusCode: 400,
         code: 'GUEST_COUNT_INVALID',
         details: { field: 'guest_count' },
+      };
+    }
+
+    // Suspended tenants may not create new bookings. Existing bookings are left
+    // untouched (see SUSPENDED_BOOKING_REVIEW_REASON policy above).
+    if (await isUserSuspended(tenant_id)) {
+      return {
+        success: false,
+        error: 'Your account is suspended and cannot create new bookings',
+        statusCode: 403,
+        code: 'ACCOUNT_SUSPENDED',
       };
     }
 
@@ -1010,6 +1139,8 @@ export class BookingService {
       checkOut:   check_out,
       clientTotal: total_price,
       quoteToken:  input.quote_token,
+      quoteId:     input.quote_id,
+      quoteAcceptedAt: input.quote_accepted_at,
       guestCount:  guest_count,
     });
     if (!priceCheck.success || !priceCheck.data) {
@@ -1105,7 +1236,10 @@ export class BookingService {
         listing_terms_snapshot: termsSnapshot.data.terms,
         listing_revision: termsSnapshot.data.revision,
         pricing_version: priceCheck.data.quote.pricing_version ?? null,
-        pricing_snapshot: pricingSnapshotFromQuote(priceCheck.data.quote),
+        pricing_snapshot: {
+          ...pricingSnapshotFromQuote(priceCheck.data.quote),
+          quote_accepted_at: input.quote_accepted_at ?? null,
+        },
       })
       .eq('id', bookingId);
 
@@ -1232,7 +1366,8 @@ export class BookingService {
     createNotification(tenant_id, 'booking_created', { booking_id: booking.id, property_id }).catch(
       () => {},
     );
-    incCounter(bookingsCreatedTotal, { property_id });
+    // Bounded label only — never the property/booking id (unbounded cardinality).
+    incCounter(bookingsCreatedTotal, { source: 'api' });
 
     // 8. Create on-chain booking record (non-fatal on failure).
     if (prop.on_chain_id !== undefined && prop.on_chain_id !== null) {
@@ -1314,6 +1449,24 @@ export class BookingService {
     bookingId: string,
     userId: string,
     now: Date = new Date(),
+    userRole?: string,
+  ): Promise<ServiceResponse<Booking>> {
+    const startedAt = process.hrtime.bigint();
+    const result = await this.cancelBookingInner(bookingId, userId, now, userRole);
+    observeHistogram(bookingWorkflowDurationSeconds, Number(process.hrtime.bigint() - startedAt) / 1e9, {
+      stage: 'cancel',
+    });
+    incCounter(bookingWorkflowTotal, {
+      stage: 'cancel',
+      outcome: result.success ? 'success' : 'failure',
+    });
+    return result;
+  }
+
+  private async cancelBookingInner(
+    bookingId: string,
+    userId: string,
+    now: Date,
     userRole?: string,
   ): Promise<ServiceResponse<Booking>> {
     if (!bookingId) {
@@ -1622,6 +1775,23 @@ export class BookingService {
    * DB and on-chain status to Confirmed.
    */
   async confirmBooking(bookingId: string, userId: string, userRole?: string): Promise<ServiceResponse<Booking>> {
+    const startedAt = process.hrtime.bigint();
+    const result = await this.confirmBookingInner(bookingId, userId, userRole);
+    observeHistogram(bookingWorkflowDurationSeconds, Number(process.hrtime.bigint() - startedAt) / 1e9, {
+      stage: 'confirm',
+    });
+    incCounter(bookingWorkflowTotal, {
+      stage: 'confirm',
+      outcome: result.success ? 'success' : 'failure',
+    });
+    return result;
+  }
+
+  private async confirmBookingInner(
+    bookingId: string,
+    userId: string,
+    userRole?: string,
+  ): Promise<ServiceResponse<Booking>> {
     if (!bookingId) {
       return { success: false, error: 'Booking ID is required' };
     }
@@ -1727,6 +1897,23 @@ export class BookingService {
    * @param userId    - ID of the caller (must be the tenant)
    */
   async completeBooking(bookingId: string, userId: string, userRole?: string): Promise<ServiceResponse<Booking>> {
+    const startedAt = process.hrtime.bigint();
+    const result = await this.completeBookingInner(bookingId, userId, userRole);
+    observeHistogram(bookingWorkflowDurationSeconds, Number(process.hrtime.bigint() - startedAt) / 1e9, {
+      stage: 'complete',
+    });
+    incCounter(bookingWorkflowTotal, {
+      stage: 'complete',
+      outcome: result.success ? 'success' : 'failure',
+    });
+    return result;
+  }
+
+  private async completeBookingInner(
+    bookingId: string,
+    userId: string,
+    userRole?: string,
+  ): Promise<ServiceResponse<Booking>> {
     if (!bookingId) {
       return { success: false, error: 'Booking ID is required' };
     }
@@ -1944,6 +2131,28 @@ export class BookingService {
       return { success: false, error: 'No fields provided for update' };
     }
 
+    // Status is never a generic mutable field: every change must go through the
+    // validated state machine so a matching history row is written atomically.
+    if (payload.status) {
+      const { data: current, error: currentError } = await supabase
+        .from('bookings')
+        .select('status')
+        .eq('id', id)
+        .maybeSingle();
+      if (currentError) return { success: false, error: currentError.message };
+      if (!current) return { success: false, error: 'Booking not found', statusCode: 404 };
+
+      const { status, ...extra } = payload;
+      return this.transitionStatus(
+        id,
+        (current as { status: string }).status,
+        status as string,
+        actor.id,
+        `Status updated by ${actor.role ?? 'admin'}`,
+        extra,
+      );
+    }
+
     const { data, error } = await supabase
       .from('bookings')
       .update(payload)
@@ -2047,6 +2256,23 @@ export class BookingService {
       error,
       meta: { actor_role: actor.role ?? null },
     });
+  }
+
+  /**
+   * Apply the booking-side effects of suspending a user (issue #978 / #083).
+   *
+   * Called by the admin moderation flow after the suspension itself has been
+   * recorded. This does NOT cancel bookings or move funds — it only flags the
+   * user's active bookings for admin review so an operator can decide what to
+   * do with each one. Restoration deliberately does not call this in reverse:
+   * see the SUSPENDED_BOOKING_REVIEW_REASON policy comment above.
+   */
+  async flagBookingsForSuspendedUser(userId: string): Promise<ServiceResponse<{ flagged: true }>> {
+    if (!userId) {
+      return { success: false, error: 'User ID is required' };
+    }
+    await flagActiveBookingsForSuspension(userId);
+    return { success: true, data: { flagged: true } };
   }
 
   // ── Dispute ────────────────────────────────────────────────────────────────
@@ -2536,6 +2762,16 @@ export class BookingService {
       return { success: false, error: 'Forbidden: only the tenant can request a modification' };
     }
 
+    // Suspended tenants may not request booking modifications.
+    if (await isUserSuspended(tenantId)) {
+      return {
+        success: false,
+        error: 'Your account is suspended and cannot request booking modifications',
+        statusCode: 403,
+        code: 'ACCOUNT_SUSPENDED',
+      };
+    }
+
     if (booking.status === 'Cancelled' || booking.status === 'Completed' || booking.status === 'Disputed') {
       return {
         success: false,
@@ -2694,6 +2930,16 @@ export class BookingService {
 
     if (booking.properties.owner_id !== hostId) {
       return { success: false, error: 'Forbidden: only the host can accept a modification' };
+    }
+
+    // Suspended hosts may not accept booking modifications.
+    if (await isUserSuspended(hostId)) {
+      return {
+        success: false,
+        error: 'Your account is suspended and cannot accept booking modifications',
+        statusCode: 403,
+        code: 'ACCOUNT_SUSPENDED',
+      };
     }
 
     const { data: modificationData, error: modError } = await supabase
@@ -2870,6 +3116,16 @@ export class BookingService {
 
     if (booking.properties.owner_id !== hostId) {
       return { success: false, error: 'Forbidden: only the host can decline a modification' };
+    }
+
+    // Suspended hosts may not decline booking modifications.
+    if (await isUserSuspended(hostId)) {
+      return {
+        success: false,
+        error: 'Your account is suspended and cannot decline booking modifications',
+        statusCode: 403,
+        code: 'ACCOUNT_SUSPENDED',
+      };
     }
 
     const { data: modificationData, error: modError } = await supabase
