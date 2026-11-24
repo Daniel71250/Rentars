@@ -1,6 +1,9 @@
 import type { Request, Response } from 'express';
 import { propertySchema, updatePropertySchema } from '@/validators/property.validator.js';
 import type { ZodError } from 'zod';
+import crypto from 'node:crypto';
+import { recordPropertyView, getPropertyViewStats, getPropertyViewCount } from '@/services/propertyView.service.js';
+import { isBot } from '@/utils/botDetection.js';
 
 import {
   createProperty,
@@ -24,11 +27,7 @@ import {
 import { trackSearch, getSearchSuggestions, getTrendingSearches, trackSuggestionEvent } from '@/services/searchAnalytics.service.js';
 import { computeZeroResultSuggestions, getPriceHistogram } from '@/services/propertySearch.service.js';
 import { supabase } from '@/config/supabase.js';
-import {
-  hostAllowsExactLocation,
-  redactPublicLocationResponse,
-  resolveLocationTier,
-} from '@/utils/locationPrivacy.js';
+import { redactExactCoordinates, resolveLocationTier, markExactLocation } from '@/utils/locationPrivacy.js';
 import type { AuthRequest } from '@/middleware/auth.middleware.js';
 
 // ─── Location-privacy helpers ─────────────────────────────────────────────────
@@ -54,11 +53,11 @@ async function applyLocationPrivacy(
     supabase,
   );
 
-  return redactPublicLocationResponse(property, {
-    tier,
-    // Booking participants only see exact coordinates with explicit host opt-in.
-    hostAllowsExact: hostAllowsExactLocation(property as Property),
-  }) as unknown as Record<string, unknown>;
+  if (tier === 'host' || tier === 'booking') {
+    return markExactLocation(property) as unknown as Record<string, unknown>;
+  }
+
+  return redactExactCoordinates(property as Property & { latitude?: number; longitude?: number }) as unknown as Record<string, unknown>;
 }
 
 /**
@@ -399,6 +398,21 @@ export async function advancedSearchHandler(req: Request, res: Response): Promis
     return;
   }
 
+  // Validate guests (#944): the same guest-count range enforced at listing
+  // creation, quote, and booking creation. Zero, negative, non-integer, and
+  // non-numeric values fail explicitly instead of being coerced to a default.
+  const guests_raw = req.query.guests !== undefined ? Number(req.query.guests) : undefined;
+  if (
+    guests_raw !== undefined &&
+    (!Number.isInteger(guests_raw) || guests_raw < MIN_GUESTS || guests_raw > MAX_GUESTS)
+  ) {
+    res.status(400).json({
+      error: `guests must be an integer between ${MIN_GUESTS} and ${MAX_GUESTS}`,
+      code: 'INVALID_GUEST_COUNT',
+    });
+    return;
+  }
+
   const filters: AdvancedSearchFilters = {
     query: req.query.q as string,
     city: req.query.city as string,
@@ -408,7 +422,7 @@ export async function advancedSearchHandler(req: Request, res: Response): Promis
     bedrooms: req.query.bedrooms ? Number(req.query.bedrooms) : undefined,
     min_bathrooms: min_bathrooms_raw,
     property_types,
-    guests: req.query.guests ? Number(req.query.guests) : undefined,
+    guests: guests_raw,
     amenities: req.query.amenities
       ? Array.isArray(req.query.amenities)
         ? (req.query.amenities as string[])
@@ -612,6 +626,7 @@ export async function getViewStatsHandler(req: Request, res: Response): Promise<
 // ─── Occupancy heatmap ────────────────────────────────────────────────────────
 
 import { getOccupancyHeatmap } from '@/services/occupancy.service.js';
+import { MIN_GUESTS, MAX_GUESTS } from '@/validators/guestCount.js';
 
 function zodFieldErrors(error: ZodError): Record<string, string[]> {
   const fields: Record<string, string[]> = {};
@@ -838,6 +853,53 @@ export async function getPropertyVersionsHandler(req: AuthRequest, res: Response
   }
 
   res.json(result.data);
+}
+
+/**
+ * GET /api/v1/properties/:id/publish-readiness
+ *
+ * Returns the publish readiness status for a draft property. Owner-only.
+ * Response: { ready: boolean; missingFields: string[]; imageCount: number }
+ */
+export async function getPublishReadinessHandler(req: AuthRequest, res: Response): Promise<void> {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const propertyId = req.params.id as string;
+
+  const { supabase: supabaseClient } = await import('../config/supabase.js');
+
+  // Verify ownership
+  const { data: property, error: propError } = await supabaseClient
+    .from('properties')
+    .select('*')
+    .eq('id', propertyId)
+    .eq('owner_id', userId)
+    .maybeSingle();
+
+  if (propError || !property) {
+    res.status(404).json({ error: 'Property not found' });
+    return;
+  }
+
+  const { count: imageCount } = await supabaseClient
+    .from('property_images')
+    .select('id', { count: 'exact', head: true })
+    .eq('property_id', propertyId)
+    .in('moderation_status', ['pending', 'approved']);
+
+  const { getPublishReadiness } = await import('../services/property.service.js');
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const readiness = getPublishReadiness(property as any, imageCount ?? 0);
+
+  res.json({
+    ready: readiness.ready,
+    missingFields: readiness.missingFields,
+    imageCount: imageCount ?? 0,
+  });
 }
 
 /**

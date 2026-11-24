@@ -301,7 +301,8 @@ export async function createBooking(req: Request, res: Response): Promise<void> 
       // We claimed the key — proceed and complete or release on failure.
       const claimedId = (lockData as { claimed: true; id: string }).id;
 
-      const result = await bookingService.createBooking(req.body);
+      const bookingInput = { ...req.body, tenant_id: req.body.tenant_id ?? userId };
+      const result = await bookingService.createBooking(bookingInput);
 
       if (!result.success) {
         // Release the processing lock so the caller can retry.
@@ -325,7 +326,8 @@ export async function createBooking(req: Request, res: Response): Promise<void> 
   }
 
   // ── Fallback: no idempotency key provided ───────────────────────────────────
-  const result = await bookingService.createBooking(req.body);
+  const bookingInput = { ...req.body, tenant_id: req.body.tenant_id ?? userId };
+  const result = await bookingService.createBooking(bookingInput);
 
   if (!result.success) {
     const status = bookingErrorStatus(result);
@@ -866,6 +868,32 @@ export async function resolveDispute(req: Request, res: Response): Promise<void>
   if (!result.success) {
     const statusCode = result.statusCode ?? (result.error?.startsWith('Forbidden') ? 403 : 400);
     res.status(statusCode).json({ error: result.error });
+    return;
+  }
+
+  res.json(result.data);
+}
+
+/**
+ * GET /api/v1/bookings/:id/dispute/timeline
+ *
+ * Participant-safe dispute timeline. Distinguishes the recorded decision from
+ * the (possibly still pending or failed) financial settlement action, without
+ * exposing internal evidence or reviewer notes. (#943)
+ *
+ * Access: the booking tenant, the property host, or an admin/moderator.
+ */
+export async function getDisputeTimeline(req: Request, res: Response): Promise<void> {
+  const actor = bookingActor(req);
+  if (!actor) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const result = await bookingService.getDisputeTimelineForActor(req.params.id, actor);
+
+  if (!result.success) {
+    res.status(result.statusCode ?? 404).json({ error: result.error });
     return;
   }
 

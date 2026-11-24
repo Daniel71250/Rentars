@@ -36,7 +36,7 @@
  *     quarantined rather than silently accepted.
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { supabase } from '@/config/supabase.js';
 import { auditLogger } from './auditLogger.service.js';
 import {
@@ -668,6 +668,50 @@ export function mapProviderStatus(raw: string): PaymentStatus {
   return PROVIDER_STATUS_MAP[raw] ?? 'under_review';
 }
 
+/** Keys whose values must never be persisted in the event ledger. */
+const REDACTED_KEY_PATTERN = /(secret|token|password|credential|private[_-]?key|api[_-]?key|authorization|signature)/i;
+
+/**
+ * Recursively redact credential-like values from an event payload.
+ * Returns a new object; the input is never mutated.
+ */
+export function redactPayload(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => redactPayload(item));
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = REDACTED_KEY_PATTERN.test(key) ? '[REDACTED]' : redactPayload(val);
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Derive the current payment status reproducibly from an ordered list of
+ * stored events. Events are replayed through the same transition graph used
+ * by the live service, so the result is deterministic for a given history.
+ *
+ * Out-of-order events are sorted by `created_at` (then id) before replay.
+ * Disallowed transitions quarantine to `under_review`, matching live behaviour.
+ */
+export function deriveStatusFromEvents(events: ReadonlyArray<PaymentEvent>): PaymentStatus {
+  const ordered = [...events].sort((a, b) => {
+    const byTime = a.created_at.localeCompare(b.created_at);
+    return byTime !== 0 ? byTime : a.id.localeCompare(b.id);
+  });
+
+  let status: PaymentStatus = 'pending';
+  for (const event of ordered) {
+    if (!event.status) continue;
+    if (event.status === status) continue;
+    status = isAllowedTransition(status, event.status) ? event.status : 'under_review';
+  }
+  return status;
+}
+
 // ─── Service functions ────────────────────────────────────────────────────────
 
 /**
@@ -760,6 +804,18 @@ export async function createPaymentIntent(
   }
 
   const payment = rowToPayment(data);
+
+  // Append the genesis event so the ledger is complete from creation.
+  await appendPaymentEvent({
+    paymentId: payment.id,
+    eventType: 'intent_created',
+    status: 'pending',
+    provider: escrowId ? 'trustlesswork' : 'stellar',
+    network: metadata?.network as string | undefined ?? null,
+    externalRef: escrowId ?? null,
+    payload: { bookingId, amountStroops: amountStroops.toString(), quoteHash },
+    actorId: tenantId,
+  });
 
   await auditLogger.log({
     actorId: tenantId,
@@ -901,9 +957,28 @@ export async function transitionPaymentStatus(
   }
 
   const eventHash = hashEventPayload(eventPayload);
+  const providerClass = providerClassFor(eventPayload);
 
   // ── Idempotency: same event hash → replay without side-effects ────────────
   if (payment.last_event_hash === eventHash) {
+    return {
+      success: true,
+      data: { payment, replayed: true },
+    };
+  }
+
+  // ── Idempotency: same idempotency key already in the ledger ───────────────
+  const idempotencyKey =
+    typeof eventPayload.idempotency_key === 'string'
+      ? eventPayload.idempotency_key
+      : eventHash;
+  const { data: existingEvent } = await supabase
+    .from('payment_events')
+    .select('id')
+    .eq('payment_id', paymentId)
+    .eq('idempotency_key', idempotencyKey)
+    .maybeSingle();
+  if (existingEvent) {
     return {
       success: true,
       data: { payment, replayed: true },
@@ -937,6 +1012,10 @@ export async function transitionPaymentStatus(
     };
   }
 
+  const stopTimer = paymentWorkflowDurationSeconds.startTimer({
+    operation: 'transition',
+  });
+
   const { data, error } = await supabase
     .from('payments')
     .update(updatePayload)
@@ -944,6 +1023,8 @@ export async function transitionPaymentStatus(
     .eq('version', payment.version) // optimistic concurrency guard
     .select()
     .single();
+
+  stopTimer();
 
   if (error || !data) {
     // Version conflict — another process transitioned first
@@ -954,6 +1035,23 @@ export async function transitionPaymentStatus(
   }
 
   const updated = rowToPayment(data);
+
+  // ── Append immutable ledger event (history is never overwritten) ──────────
+  const eventType: PaymentEventType =
+    targetStatus === 'under_review' ? 'under_review' : (targetStatus as PaymentEventType);
+  await appendPaymentEvent({
+    paymentId,
+    eventType,
+    status: targetStatus,
+    idempotencyKey,
+    correlationId:
+      typeof eventPayload.correlation_id === 'string' ? eventPayload.correlation_id : undefined,
+    provider: typeof eventPayload.provider === 'string' ? eventPayload.provider : null,
+    network: typeof eventPayload.network === 'string' ? eventPayload.network : null,
+    externalRef: txHash ?? null,
+    payload: eventPayload,
+    actorId,
+  });
 
   // ── Audit ─────────────────────────────────────────────────────────────────
   const auditAction =
@@ -1094,6 +1192,31 @@ export function toStroops(usdcAmount: string): bigint {
 /**
  * Map a raw Supabase row to a typed Payment, handling BigInt conversion.
  */
+/**
+ * Map a raw Supabase row from `payment_events` to a typed PaymentEvent.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: raw Supabase row
+function rowToPaymentEvent(row: any): PaymentEvent {
+  return {
+    id:              row.id,
+    payment_id:      row.payment_id,
+    booking_id:      row.booking_id,
+    quote_hash:      row.quote_hash ?? null,
+    provider:        row.provider ?? null,
+    network:         row.network ?? null,
+    amount_stroops:  BigInt(row.amount_stroops ?? 0),
+    currency:        row.currency ?? 'USDC',
+    event_type:      row.event_type as PaymentEventType,
+    status:          (row.status as PaymentStatus | null) ?? null,
+    idempotency_key: row.idempotency_key,
+    correlation_id:  row.correlation_id,
+    external_ref:    row.external_ref ?? null,
+    event_hash:      row.event_hash,
+    payload:         row.payload ?? {},
+    created_at:      row.created_at,
+  };
+}
+
 // biome-ignore lint/suspicious/noExplicitAny: raw Supabase row
 function rowToPayment(row: any): Payment {
   return {
