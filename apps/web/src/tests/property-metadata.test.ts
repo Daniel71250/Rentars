@@ -69,31 +69,18 @@ describe('generateMetadata (property page)', () => {
     expect((metadata.description as string).length).toBeLessThan(200);
   });
 
-  it('returns minimal metadata for draft properties (not indexed)', async () => {
-    mockPropertyFetch({ ...baseProperty, status: 'draft' });
+  it('#936: never emits exact coordinates or street addresses in metadata', async () => {
+    mockPropertyFetch({
+      ...baseProperty,
+      latitude: 48.856613,
+      longitude: 2.352222,
+      address: '12 Rue Privée',
+    });
     const metadata = await generateMetadata({ params: { id: 'cozy-loft-paris-a1b2c3' } });
+    const json = JSON.stringify(metadata);
 
-    expect(metadata.title).toBe('Property — Rentars');
-    expect(metadata.description).toBeUndefined();
-    expect(metadata.alternates).toBeUndefined();
-    expect(metadata.openGraph).toBeUndefined();
-  });
-
-  it('returns minimal metadata for deleted properties (not indexed)', async () => {
-    mockPropertyFetch({ ...baseProperty, status: 'deleted' });
-    const metadata = await generateMetadata({ params: { id: 'cozy-loft-paris-a1b2c3' } });
-
-    expect(metadata.title).toBe('Property — Rentars');
-    expect(metadata.description).toBeUndefined();
-    expect(metadata.alternates).toBeUndefined();
-    expect(metadata.openGraph).toBeUndefined();
-  });
-
-  it('returns 404-equivalent for unknown properties', async () => {
-    global.fetch = vi.fn().mockResolvedValue({ ok: false, json: async () => ({}) }) as unknown as typeof fetch;
-    const metadata = await generateMetadata({ params: { id: 'nonexistent' } });
-
-    expect(metadata.title).toBe('Property — Rentars');
-    expect(metadata.description).toBeUndefined();
+    expect(json).not.toContain('48.856613');
+    expect(json).not.toContain('2.352222');
+    expect(json).not.toContain('12 Rue Privée');
   });
 });

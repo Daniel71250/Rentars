@@ -24,7 +24,7 @@ export async function reverseGeocodeAddress(req: Request, res: Response): Promis
   const result = await locationService.reverseGeocode(coordinates.lat, coordinates.lng);
 
   if (!result.success) {
-    res.status(result.statusCode || 400).json({ error: result.error });
+    sendLocationError(res, result);
     return;
   }
 
@@ -37,7 +37,7 @@ export async function geocodeAddress(req: Request, res: Response): Promise<void>
   const result = await locationService.geocode(address as string);
 
   if (!result.success) {
-    res.status(result.statusCode || 400).json({ error: result.error });
+    sendLocationError(res, result);
     return;
   }
 
@@ -64,11 +64,13 @@ export async function searchNearby(req: Request, res: Response): Promise<void> {
   );
 
   if (!result.success) {
-    res.status(result.statusCode || 400).json({ error: result.error });
+    sendLocationError(res, result);
     return;
   }
 
-  res.json(result.data);
+  // Nearby listings are a public endpoint: never expose exact residential
+  // coordinates or private address fields from LocationService.
+  res.json(redactPublicLocationResponse(result.data, { tier: 'public' }));
 }
 
 export async function getPriceComparison(req: Request, res: Response): Promise<void> {
@@ -91,7 +93,7 @@ export async function getPriceComparison(req: Request, res: Response): Promise<v
   );
 
   if (!result.success) {
-    res.status(result.statusCode || 400).json({ error: result.error });
+    sendLocationError(res, result);
     return;
   }
 

@@ -215,13 +215,22 @@ export default async function PropertyPage({
     description: property.description_full || property.description || 'Accommodation on Rentars',
     image:       property.images?.[0]?.url,
     url:         canonicalUrl,
-    ...addressBlock,
-    ...(typeof property.latitude === 'number' && typeof property.longitude === 'number'
+    address: {
+      '@type':          'PostalAddress',
+      // Street-level addresses are private: metadata is public HTML and is
+      // cached by crawlers, so only city/country may be published.
+      addressLocality:  property.city || property.location,
+      addressCountry:   property.country,
+    },
+    // #936: never publish exact coordinates in HTML metadata. Only the
+    // approved approximation from the public API may be emitted.
+    ...(typeof (property as Record<string, unknown>).approximate_latitude === 'number' &&
+    typeof (property as Record<string, unknown>).approximate_longitude === 'number'
       ? {
           geo: {
             '@type':    'GeoCoordinates',
-            latitude:   property.latitude,
-            longitude:  property.longitude,
+            latitude:   (property as Record<string, unknown>).approximate_latitude,
+            longitude:  (property as Record<string, unknown>).approximate_longitude,
           },
         }
       : {}),

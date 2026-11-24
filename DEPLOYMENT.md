@@ -137,7 +137,81 @@ curl -sfI "$FRONTEND_URL" | head -1
 
 ---
 
+### 2.3 Deployment health gates (promotion blockers)
+
+A release must not receive production traffic until every required gate below
+passes. Gates are evaluated by `scripts/deploy-smoke.ts` (see
+`docs/releases/smoke-checks.md` for the full check list and exit codes) and the
+result is written to the release manifest. Exit codes: `0` = pass (promote),
+`10` = blocked (hold traffic on the previous version), `20` = rollback.
+
+**Environment safety:** every smoke check is read-only or uses simulation. No
+check may create a real booking, charge a card, or transfer funds. Payment
+checks run against Stellar testnet or a mocked payment provider only, and the
+script refuses to run payment checks when `STELLAR_NETWORK=mainnet` unless
+`PAYMENT_SMOKE_MODE=simulate` is set. Smoke checks must never be run with
+production service-role keys that can write to live tables.
+
+#### Preflight gates (before deploying)
+
+| Gate | Check | Pass condition |
+|---|---|---|
+| API readiness | `GET $BACKEND_URL/health` and `/health/deep` on the candidate build in staging | `status: ok`, all dependencies `connected` |
+| Frontend availability | `curl -sfI $FRONTEND_URL` on the preview deployment | HTTP 200, expected build/commit header |
+| Database compatibility | `psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f setup.sql` dry run against a restored snapshot, plus `bun run test:contract` | migrations apply cleanly, no undocumented API changes |
+| Payment configuration | `PAYMENT_SMOKE_MODE=simulate bun run test:payments` | provider keys present, simulated intent succeeds, no live charge |
+
+#### Post-deploy gates (before traffic promotion)
+
+| Gate | Check | Pass condition |
+|---|---|---|
+| API readiness | `curl -sf "$BACKEND_URL/health" \| jq .` and `/health/deep` | `status: ok`, dependencies `connected` |
+| Auth metadata | `curl -s -o /dev/null -w '%{http_code}' "$BACKEND_URL/api/v1/bookings"` | `401` (auth guard active) |
+| Property read | `curl -sf "$BACKEND_URL/api/v1/properties?limit=1" \| jq '.data \| length'` | `200` + JSON array |
+| Frontend availability | `curl -sfI "$FRONTEND_URL" \| head -1` | HTTP 200 |
+| Database compatibility | migration version matches the release manifest; read-only query succeeds | versions equal, query returns |
+| Payment configuration | simulated payment path on testnet/mock | success, zero real funds moved |
+
+**Promotion rule:** traffic promotion (canary → 100%) is blocked while any
+required gate is failing or unrecorded. A failed required gate either holds the
+release on the previous version or, if the failure is in a gate marked
+`rollback` in `docs/releases/health-gates.json`, triggers the rollback runbook
+in §7.9. Gates are re-run after any rollback before traffic is restored.
+
+#### Rollback constraints for schema and contract changes
+
+- **Schema:** migrations are forward-only in production. Roll back by restoring
+  the pre-release backup (§7.4); do not hand-write down-migrations on live data.
+  Destructive changes (drop/rename) must ship one release after the code that
+  stops using them (§7.7).
+- **Contracts:** Soroban contracts are immutable. A contract defect cannot be
+  rolled back in place — use the fix-forward path in §7.3 (deploy a patched
+  contract, update contract IDs, re-run post-deploy gates) or restore the
+  previous contract IDs in the backend environment.
+- **Fix-forward:** when a rollback is unsafe (e.g. a migration already applied
+  and depended on by new data), document the decision in the release record,
+  ship a forward fix behind a feature flag, and keep the failing gate red until
+  the fix passes.
+
+#### Release manifest
+
+Every deployment writes a release manifest (see
+`docs/releases/release-manifest.schema.json`) recording:
+
+- `version` and `commit` — the deployed build
+- `migration_state` — applied migration version / `setup.sql` checksum
+- `contract_ids` — property listing, booking, review
+- `health_results` — per-gate status, observed value, timestamp, and the
+  `deploy-smoke.ts` exit code
+- `rollback` — whether a rollback or fix-forward was taken, with approvers
+
+The manifest is the source of truth for §8.1 release state tracking; a release
+without a complete manifest is not considered promoted.
+
+---
+
 ## 3. Stellar Testnet Setup
+=======
 
 ### 3.1 Create and fund testnet accounts
 
@@ -235,7 +309,9 @@ production. Populate the following values:
 - `SUPABASE_SERVICE_ROLE_KEY` — Supabase service role key
 - `JWT_SECRET` — secure JWT signing secret
 - `CORS_ORIGIN` — frontend origin URL
-- `REDIS_URL` — Redis connection string
+- `REDIS_URL` — Redis connection string (shared by all instances; see §4.3)
+- `TRUSTED_PROXY_HOPS` — number of trusted proxy hops for client IP resolution (default `0`; see §4.4)
+- `TRUSTED_PROXY_CIDRS` — optional comma-separated CIDRs of trusted proxies (recommended; see §4.4)
 - `STELLAR_NETWORK` — `testnet` or `mainnet`
 - `STELLAR_RPC_URL` — Soroban RPC URL
 - `PROPERTY_LISTING_CONTRACT_ID` — on-chain contract ID
@@ -292,7 +368,101 @@ For local Docker-based development, the repo includes `apps/backend/docker-compo
 
 For production, use a Redis provider and set `REDIS_URL` to the provider’s secure URL.
 
-### 4.4 Backend startup commands
+#### Redis requirements for shared rate-limit counters
+
+Rate limiting is enforced with Redis-backed counters so that every backend
+instance applies the same policy. When running more than one instance:
+
+- **All instances must point at the same Redis database.** Do not use per-instance
+  or per-AZ Redis replicas for counters; a counter written on instance A must be
+  visible to instance B. Use a single logical Redis (or a cluster with a shared
+  keyspace) for the rate-limit keys.
+- **Do not use `FLUSHDB`/`FLUSHALL` on the production Redis** during rollbacks or
+  maintenance (see §7.8). Flushing the database resets every rate-limit counter,
+  which temporarily lets clients exceed their budgets. Prefer selective key
+  deletion by pattern.
+- **Do not configure eviction for rate-limit keys.** If Redis is configured with
+  `maxmemory-policy allkeys-lru` (or similar), counters can be evicted under
+  memory pressure, silently resetting budgets. Either provision enough memory, or
+  isolate rate-limit keys in a dedicated Redis database/instance with
+  `noeviction`.
+- **Keep clocks and TTLs consistent.** Counters rely on Redis TTLs, not on
+  instance clocks, so instances with skewed clocks still agree on window expiry.
+  Ensure the Redis server itself has a stable clock (NTP) for TTL accuracy.
+- **Replication lag is bounded, not zero.** With a replicated Redis, a failover
+  can lose a small number of recent increments. Budgets are sized so that this
+  window cannot be used to meaningfully exceed a limit; do not rely on exact
+  counter equality across instances.
+- **Fail closed or open deliberately.** If Redis is unreachable, the backend
+  should apply its configured fallback (reject with `503`/`429` or allow with
+  logging). Document the chosen behavior for your deployment and alert on Redis
+  connectivity errors (§8.6).
+
+### 4.4 Trusted proxy configuration for client identity
+
+Rate limits are keyed by identity: the authenticated user ID when a valid token
+is present, otherwise the client IP. Because the backend usually sits behind a
+load balancer or reverse proxy, the client IP must be derived from forwarding
+headers **only when those headers were written by a trusted hop**. Otherwise any
+client can forge `X-Forwarded-For` and evade IP-based limits.
+
+Configure the following backend environment variables to match your actual
+deployment topology:
+
+- `TRUSTED_PROXY_HOPS` — the number of proxy hops in front of the backend that
+  are allowed to append to `X-Forwarded-For`. The backend reads the client IP
+  from the right-hand side of the header, skipping exactly this many hops.
+  Default is `0` (no proxy trusted; forwarding headers are ignored).
+- `TRUSTED_PROXY_CIDRS` — optional comma-separated list of CIDR ranges for the
+  proxies. When set, a forwarding header is only honored if the immediate peer
+  address falls inside one of these ranges. This is the strongest option and is
+  recommended for production.
+
+Rules:
+
+- **Never trust `X-Forwarded-For` blindly.** With `TRUSTED_PROXY_HOPS=0` and no
+  CIDRs, the backend uses the socket peer address and ignores all forwarding
+  headers. This is the safe default for direct-to-instance deployments.
+- **Count hops from your own topology, not from the header.** A client can send
+  any number of `X-Forwarded-For` entries; only the entries appended by your
+  trusted proxies are meaningful. Set `TRUSTED_PROXY_HOPS` to the exact number of
+  proxies between the internet and the backend.
+- **Prefer CIDR pinning.** If your load balancer addresses are stable, set
+  `TRUSTED_PROXY_CIDRS` so that a spoofed header from an untrusted peer is
+  rejected even if the hop count is misconfigured.
+- **Keep the setting identical on every instance.** Mixed configurations cause
+  the same client to be keyed differently on different instances, splitting
+  counters and weakening limits.
+
+Common topologies:
+
+| Topology | `TRUSTED_PROXY_HOPS` | `TRUSTED_PROXY_CIDRS` |
+|---|---|---|
+| Direct to backend (no proxy) | `0` | unset |
+| Single load balancer (ALB, nginx, Caddy) | `1` | LB subnet range (recommended) |
+| CDN → load balancer → backend | `2` | CDN + LB ranges |
+| Kubernetes ingress → service → pod | `1` (or `2` if a sidecar proxy is present) | ingress controller pod CIDR |
+| Vercel/Cloudflare in front of your own LB | `2` | CDN egress + LB ranges |
+
+Verify the configuration after deployment by sending a request with a forged
+header and confirming the limit is still applied to the real client:
+
+```bash
+# Forged X-Forwarded-For must NOT create a fresh budget
+for i in $(seq 1 30); do
+  curl -s -o /dev/null -w '%{http_code}\n' \
+    -H "X-Forwarded-For: 203.0.113.$i" \
+    "$BACKEND_URL/api/v1/properties?limit=1"
+done
+# Expect 429 responses once the real client's budget is exhausted,
+# regardless of the rotating forged addresses.
+```
+
+Rate-limit responses include a `Retry-After` header (seconds) and a JSON body
+with a `retryAfter` field so clients can back off safely. Do not expose internal
+counter keys or raw IPs in these responses.
+
+### 4.5 Backend startup commands
 
 Local development (backend listens on `PORT=3000`):
 
@@ -402,6 +572,8 @@ Perform the following before mainnet launch:
 - Static analysis for Smart Contract code
 - Review backend input validation and authentication flows
 - Verify CORS origins and JWT secret policies
+- Verify `TRUSTED_PROXY_HOPS`/`TRUSTED_PROXY_CIDRS` match the production topology and that forged `X-Forwarded-For` headers cannot reset rate-limit budgets
+- Verify all backend instances share one Redis for rate-limit counters and that eviction is disabled for those keys
 - Conduct a security review of network access and firewall rules
 - Confirm database permissions and Supabase RLS policies if used
 
@@ -423,11 +595,20 @@ Perform the following before mainnet launch:
 
 ### 7.3 Contract rollback
 
-Smart contracts on Stellar are immutable. If a contract bug is discovered in production:
+Soroban contracts are immutable once deployed: a deployed contract's WASM cannot be
+patched in place. The upgrade and migration policy — which contracts are
+upgradeable, who may authorize an upgrade, how stored state and clients migrate,
+and the rollback/forward-fix plan — is defined in section 7.10 and in
+[`docs/releases/rollback.md`](docs/releases/rollback.md). In short, recovery from a
+contract defect is one of:
 
-- Deploy a new contract version with a patched ABI
-- Update `PROPERTY_LISTING_CONTRACT_ID`, `BOOKING_CONTRACT_ID`, and `REVIEW_CONTRACT_ID` in the backend
-- Verify cross-contract calls and initialization again
+- **Upgradeable contracts**: authorize an upgrade to a new WASM through the
+  contract's admin/timelock path, running the tested state migration first.
+- **Immutable contracts**: deploy a new contract version with a patched ABI,
+  migrate state if a migration entry point exists, then update
+  `PROPERTY_LISTING_CONTRACT_ID`, `BOOKING_CONTRACT_ID`, and `REVIEW_CONTRACT_ID`
+  in the backend.
+- Verify cross-contract calls and initialization again.
 
 If contract addresses are updated, also update any frontend endpoints or settings that rely on them.
 
