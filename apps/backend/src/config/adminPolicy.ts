@@ -91,6 +91,33 @@ export const ADMIN_ACTION_POLICIES: AdminActionPolicy[] = [
     preconditions: [],
     rollback: 'Read-only — no rollback needed',
   },
+  {
+    endpoint: 'GET /api/v1/admin/analytics',
+    scope: 'admin:analytics:read',
+    roles: ['admin'],
+    owner: 'analytics',
+    risk: 'low',
+    runbook: 'docs/admin-runbooks.md#runbook-8--aggregate-analytics-review',
+    preconditions: [
+      'Aggregate-only response (cohorts below minimum size suppressed)',
+      'Time window within approved bounds',
+    ],
+    rollback: 'Read-only — no rollback needed',
+  },
+  {
+    endpoint: 'GET /api/v1/admin/analytics/raw',
+    scope: 'admin:analytics:raw',
+    roles: ['admin'],
+    owner: 'analytics',
+    risk: 'high',
+    runbook: 'docs/admin-runbooks.md#runbook-9--elevated-raw-analytics-access',
+    preconditions: [
+      'Documented purpose recorded in access log',
+      'Dual approval obtained',
+      'Time window within approved bounds',
+    ],
+    rollback: 'Read-only — no rollback needed',
+  },
 ];
 
 /** High-risk = high tier (all require dual approval via middleware). */
