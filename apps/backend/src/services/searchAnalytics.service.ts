@@ -1,4 +1,5 @@
 import { supabase } from '@/config/supabase.js';
+import { normalizeSearchQuery, redactAnalyticsFilters } from '@/utils/searchMetrics.js';
 import type { ServiceResponse } from './index.js';
 
 export interface SearchAnalytic {
@@ -28,21 +29,25 @@ export interface DailyVolume {
 }
 
 /**
- * Track a search query for analytics and suggestions.
+ * Track a search query for analytics and suggestions (issue #935).
+ *
+ * Privacy rule: raw queries and personal identifiers are never stored. The
+ * query is normalised/redacted, filters are reduced to broad aggregate keys,
+ * and the caller's user id is deliberately ignored (searches are anonymous).
  */
 export async function trackSearch(
   query: string,
   resultCount: number,
-  userId?: string,
+  _userId?: string,
   filters?: Record<string, unknown>,
 ): Promise<ServiceResponse<SearchAnalytic>> {
   const { data, error } = await supabase
     .from('search_analytics')
     .insert({
-      query: query.toLowerCase(),
-      filters,
+      query: normalizeSearchQuery(query) || '[redacted]',
+      filters: redactAnalyticsFilters(filters) ?? null,
       result_count: resultCount,
-      user_id: userId,
+      user_id: null,
       created_at: new Date().toISOString(),
     })
     .select()
@@ -93,7 +98,12 @@ export async function getTopQueries(
   });
 
   if (error) return { success: false, error: error.message };
-  return { success: true, data: (data ?? []) as TopQuery[] };
+  return { success: true, data: sanitizeTopQueries((data ?? []) as TopQuery[]) };
+}
+
+/** Never expose a raw (potentially personal) query through admin reporting. */
+function sanitizeTopQueries(rows: TopQuery[]): TopQuery[] {
+  return rows.map((row) => ({ ...row, query: normalizeSearchQuery(row.query) || '[redacted]' }));
 }
 
 /**
@@ -111,7 +121,33 @@ export async function getZeroResultQueries(
   });
 
   if (error) return { success: false, error: error.message };
-  return { success: true, data: (data ?? []) as TopQuery[] };
+  return { success: true, data: sanitizeTopQueries((data ?? []) as TopQuery[]) };
+}
+
+/**
+ * Delete legacy raw analytics rows belonging to a user (deletion requests).
+ * New writes are anonymous, but old rows may still carry a user_id.
+ */
+export async function deleteSearchAnalyticsForUser(
+  userId: string,
+): Promise<ServiceResponse<null>> {
+  const { error } = await supabase.from('search_analytics').delete().eq('user_id', userId);
+  if (error) return { success: false, error: error.message };
+  return { success: true, data: null };
+}
+
+/**
+ * Enforce the approved retention window for raw search events.
+ */
+export async function deleteSearchAnalyticsBefore(
+  cutoff: Date,
+): Promise<ServiceResponse<null>> {
+  const { error } = await supabase
+    .from('search_analytics')
+    .delete()
+    .lt('created_at', cutoff.toISOString());
+  if (error) return { success: false, error: error.message };
+  return { success: true, data: null };
 }
 
 /**
@@ -137,13 +173,13 @@ export async function trackSuggestionEvent(
   eventType: 'offered' | 'accepted',
   suggestionType: string,
   originalQuery?: string,
-  userId?: string,
+  _userId?: string,
 ): Promise<void> {
   await supabase.from('search_suggestion_events').insert({
     event_type: eventType,
     suggestion_type: suggestionType,
-    original_query: originalQuery,
-    user_id: userId,
+    original_query: originalQuery ? normalizeSearchQuery(originalQuery) : null,
+    user_id: null,
   });
 }
 

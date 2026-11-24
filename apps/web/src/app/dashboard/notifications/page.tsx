@@ -60,6 +60,12 @@ export default function NotificationsPage() {
           <Settings size={18} />
           Settings
         </button>
+        <Link
+          href="/dashboard/saved-searches"
+          className="text-sm text-blue-600 hover:underline dark:text-blue-400"
+        >
+          Saved searches
+        </Link>
       </div>
 
       {showSettings && (
