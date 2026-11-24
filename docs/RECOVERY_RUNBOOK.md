@@ -688,18 +688,55 @@ and the reconcile trigger is not exposed). They are real, owned, and dated
 today; the first drill will confirm them as live failures and track them to
 closure. Retrospectives append further rows in the same format.
 
+Rows 3–6 were raised by the **2026-11-15 recovery drill, which FAILED**
+(issue #910). They must all be closed, with evidence linked in the Tracking
+link column, before #910 is closed.
+
 | # | Risk / gap | Source (step) | Owner (A) | Due date | Tracking link | Status |
 |---|---|---|---|---|---|---|
-| 1 | `sync.routes.ts` handlers exist but the router is not mounted in `apps/backend/src/routes/index.ts`; `reconcileAllPendingEscrows` is not exposed via HTTP; no `/sync/status` or `/sync/reconcile/status` or `/reconciliation/discrepancies` endpoint. Drill §6.4 and §6.7 cannot pass until routes are mounted and reconcile wired. | §6.4, §6.7 | Backend On-Call | 2026-11-15 | (issue link) | Open |
+| 1 | `sync.routes.ts` handlers exist but the router is not mounted in `apps/backend/src/routes/index.ts`; `reconcileAllPendingEscrows` is not exposed via HTTP; no `/sync/status` or `/sync/reconcile/status` or `/reconciliation/discrepancies` endpoint. Drill §6.4 and §6.7 cannot pass until routes are mounted and reconcile wired. **Confirmed live by the 2026-11-15 drill: §6.4 sync-resume returned 404 on both sync routes and the phase FAILED by design.** | §6.4, §6.7 | Backend On-Call | 2026-11-15 | (issue link) | Open |
 | 2 | Drill measures sync freshness via `sync_log` age, not direct ledger lag; on-chain lookup uses the last synced status rather than a fresh contract read. A `stellar-cli` query or read-only contract call should verify the live chain state. | §6.4, §6.6 | Contracts Lead | 2026-12-01 | (issue link) | Open |
+| 3 | **2026-11-15 drill failure — §6.7 reconciliation could not run a fresh reconcile.** Because `reconcileAllPendingEscrows` has no HTTP route (risk #1), the drill fell back to the DB-only discrepancy count and the Finance Owner's manual Trustless Work cross-check. The drill cannot prove a fresh reconcile run until the trigger endpoint exists; wire the route and re-run §6.7 in the next drill. | §6.7 | Backend On-Call | 2026-11-29 | (issue link) | Open |
+| 4 | **2026-11-15 drill failure — §6.6 booking-lookup on-chain agreement is unverified.** The phase compares against the last `sync_log` row rather than a fresh contract read, so a booking whose on-chain state changed after the last sync would pass incorrectly. Add a read-only contract call (or `stellar-cli` query) to §6.6 step 3 and record the result in the drill report. | §6.6 | Contracts Lead | 2026-12-01 | (issue link) | Open |
+| 5 | **2026-11-15 drill failure — §6.4 sync freshness proxy is too weak.** `sync_log` age < 120 s does not detect a stalled sync service that is writing rows without advancing against the ledger. Add a ledger-lag check (chain head vs. last synced ledger) to the drill runner and fail the phase when lag > 30 ledgers. | §6.4 | Infra Owner (RPC) | 2026-12-13 | (issue link) | Open |
+| 6 | **2026-11-15 drill failure — drill report sign-off incomplete.** The uploaded `recovery_drill_<ts>.json` artifact did not carry the §6.8 sign-off table (Actual / Pass-Fail / Owner columns blank), so the aggregate PASS/FAIL could not be audited from the artifact alone. Have the drill script emit the sign-off table into the JSON report and require the Incident Commander to fill it before upload. | §6.8 | Incident Commander | 2026-11-22 | (issue link) | Open |
 
 Retrospective-added rows are appended below the pre-identified rows, never
 above them, so the history of pre-identified gaps stays auditable.
+
+#### 7.2.1 Follow-up risks — recovery drill 2026-10-25 (FAILED)
+
+The recovery drill run on **2026-10-25** failed. The full logs are in the
+workflow run for
+[`.github/workflows/recovery-drill.yml`](../.github/workflows/recovery-drill.yml)
+and the machine-readable results are in the uploaded `recovery_drill_*.json`
+artifact attached to that run. The risks below are derived from that report
+and from the §6.8 sign-off table for the run.
+
+**Closure rule.** This drill's issue **cannot be closed** until every risk in
+the table below has an owner (A) and a due date, and each row's status is
+either `Closed` or has a linked tracking issue. A row with a blank owner or a
+blank due date blocks closure. The Incident Commander verifies this at the
+retrospective (§7) and records the verification in the drill issue.
+
+| # | Risk / gap (from the 2026-10-25 drill report) | Source (step) | Owner (A) | Due date | Tracking link | Status |
+|---|---|---|---|---|---|---|
+| D1 | Sync routes returned 404 during the drill: `sync.routes.ts` is not mounted in `apps/backend/src/routes/index.ts`, so §6.4 sync resume could not run and the phase failed. | §6.4 | Backend On-Call | 2026-11-15 | (issue link) | Open |
+| D2 | Reconcile trigger returned 404: `reconcileAllPendingEscrows` is not exposed via HTTP, so §6.7 could only verify state, not a fresh reconcile run. | §6.7 | Backend On-Call | 2026-11-15 | (issue link) | Open |
+| D3 | Sync freshness was measured via `sync_log` age only; no direct ledger-lag check, so §6.4 freshness could not be independently confirmed. | §6.4 | Contracts Lead | 2026-12-01 | (issue link) | Open |
+| D4 | Booking lookup (§6.6) used the last synced on-chain status rather than a fresh contract read; on-chain agreement could not be proven live. | §6.6 | Contracts Lead | 2026-12-01 | (issue link) | Open |
+| D5 | Aggregate target not met: booking lookup and payment reconciliation did not complete within 45 min of detection (see §6.8 aggregate row in the drill report). | §6.8 | Incident Commander | 2026-11-08 | (issue link) | Open |
+
+Rows D1–D5 are appended below the pre-identified rows (#1, #2) so the history
+of pre-identified gaps stays auditable. If the retrospective identifies
+additional gaps from the 2026-10-25 run, append them here in the same format
+with an owner and a due date before the issue is closed.
 
 ### 7.3 Drill history
 
 | Date | Env | Commander | Result | Aggregate reads | Lookup+recon | Report |
 |---|---|---|---|---|---|---|
+| 2026-11-15 | staging | @handle | FAIL | __ min | __ min | `recovery_drill_*.json` (see #910) |
 | YYYY-MM-DD | staging | @handle | PASS/FAIL | __ min | __ min | `recovery_drill_*.json` |
 
 After each drill, append a row. The history is the evidence reviewed at launch

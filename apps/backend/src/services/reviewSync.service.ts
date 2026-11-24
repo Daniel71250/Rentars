@@ -42,6 +42,10 @@ import { ReviewClient } from '@/blockchain/reviewClient.js';
 import { supabase } from '@/config/supabase.js';
 import type { ServiceResponse } from './index.js';
 import type { Review as ChainReview } from '@/blockchain/types.js';
+import {
+  syncWorkflowTotal,
+  syncWorkflowDurationSeconds,
+} from '@/metrics/index.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -110,6 +114,17 @@ function buildReviewClient(): ReviewClient {
 export async function reconcileReview(
   reviewId: string,
 ): Promise<ServiceResponse<{ status: ReconciliationStatus }>> {
+  const endTimer = syncWorkflowDurationSeconds.startTimer({ workflow: 'review_reconcile' });
+  try {
+    return await reconcileReviewInner(reviewId);
+  } finally {
+    endTimer();
+  }
+}
+
+async function reconcileReviewInner(
+  reviewId: string,
+): Promise<ServiceResponse<{ status: ReconciliationStatus }>> {
   if (!REVIEW_CONTRACT_ID) {
     return { success: false, error: 'REVIEW_CONTRACT_ID is not configured' };
   }
@@ -152,6 +167,7 @@ export async function reconcileReview(
           onChainId: review.on_chain_id,
         },
       });
+      syncWorkflowTotal.inc({ workflow: 'review_reconcile', outcome: 'missing' });
       return { success: true, data: { status: 'missing' } };
     }
     // Transient error — leave status as-is for retry.
@@ -180,6 +196,7 @@ export async function reconcileReview(
     }
 
     await supabase.from('reviews').update(updatePayload).eq('id', reviewId);
+    syncWorkflowTotal.inc({ workflow: 'review_reconcile', outcome: 'matched' });
     return { success: true, data: { status: 'matched' } };
   }
 
@@ -207,6 +224,7 @@ export async function reconcileReview(
     mismatchDetails,
   );
 
+  syncWorkflowTotal.inc({ workflow: 'review_reconcile', outcome: 'mismatched' });
   return { success: true, data: { status: 'mismatched' } };
 }
 
@@ -274,6 +292,7 @@ export async function detectOrphanedReviews(): Promise<ServiceResponse<{
           issueType: 'orphaned',
           details: { message: 'On-chain review has no off-chain counterpart', onChainId },
         });
+        syncWorkflowTotal.inc({ workflow: 'review_reconcile', outcome: 'orphaned' });
       }
       orphaned++;
     } else {
@@ -315,6 +334,7 @@ export async function detectDuplicateOnChainIds(): Promise<ServiceResponse<{
         issueType: 'duplicate',
         details: { message: `${count} DB reviews point to the same on_chain_id`, onChainId, count },
       });
+      syncWorkflowTotal.inc({ workflow: 'review_reconcile', outcome: 'duplicate' });
     }
   }
 

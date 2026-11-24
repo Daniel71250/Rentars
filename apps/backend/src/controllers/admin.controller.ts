@@ -80,6 +80,22 @@ export async function setFeaturedHandler(req: Request, res: Response): Promise<v
     return;
   }
 
+  // Audit the promotion change so admin actions are traceable.
+  const adminId = (req as AdminRequest).adminId;
+  await auditLogger
+    .log({
+      actorId: adminId,
+      action: 'admin.featured_set',
+      resourceType: 'property',
+      resourceId: propertyId,
+      meta: {
+        featured_until,
+        weight,
+        featured_cap: FEATURED_CAP,
+      },
+    })
+    .catch((err) => console.error('[setFeaturedHandler] audit log failed:', err));
+
   res.json({
     data: result.data,
     meta: {
@@ -109,6 +125,18 @@ export async function clearFeaturedHandler(req: Request, res: Response): Promise
     res.status(400).json({ error: result.error });
     return;
   }
+
+  // Audit the removal so admin actions are traceable.
+  const adminId = (req as AdminRequest).adminId;
+  await auditLogger
+    .log({
+      actorId: adminId,
+      action: 'admin.featured_clear',
+      resourceType: 'property',
+      resourceId: propertyId,
+      meta: { reason: 'admin_clear' },
+    })
+    .catch((err) => console.error('[clearFeaturedHandler] audit log failed:', err));
 
   res.json({
     data: result.data,
