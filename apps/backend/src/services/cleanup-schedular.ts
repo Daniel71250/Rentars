@@ -104,6 +104,7 @@ async function runEscrowReconciliation(): Promise<void> {
 }
 
 export function startSyncScheduler(): void {
+  if (process.env.NODE_ENV === 'test') return;
   // Blockchain sync
   setInterval(() => {
     runSync().catch((err) => console.error('[sync] Scheduler error:', err));

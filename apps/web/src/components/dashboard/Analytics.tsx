@@ -7,76 +7,86 @@ interface AnalyticsProps {
     month: string;
     spent: number;
   }>;
+  loading?: boolean;
+  error?: string | null;
+  onRetry?: () => void;
 }
 
-export default function Analytics({ data }: AnalyticsProps) {
-  const defaultData = [
-    { month: 'Jan', spent: 400 },
-    { month: 'Feb', spent: 300 },
-    { month: 'Mar', spent: 600 },
-    { month: 'Apr', spent: 800 },
-    { month: 'May', spent: 500 },
-    { month: 'Jun', spent: 700 },
-  ];
+export default function Analytics({ data, loading = false, error = null, onRetry }: AnalyticsProps) {
+  const hasData = Array.isArray(data) && data.length > 0;
 
-  const chartData = data || defaultData;
+  const renderBody = () => {
+    if (loading) {
+      return (
+        <div
+          role="status"
+          aria-live="polite"
+          aria-busy="true"
+          className="flex flex-col items-center justify-center h-[300px] gap-3"
+        >
+          <div className="h-8 w-8 animate-spin rounded-full border-2 border-gray-300 border-t-blue-500" aria-hidden="true" />
+          <span className="text-sm text-gray-500 dark:text-gray-400">Loading spending analytics…</span>
+        </div>
+      );
+    }
 
-  const totalSpent = chartData.reduce((sum, item) => sum + item.spent, 0);
-  const chartDescription = `Bar chart of monthly USDC spending. ${chartData
-    .map((item) => `${item.month}: ${item.spent} USDC`)
-    .join(', ')}. Total: ${totalSpent} USDC.`;
+    if (error) {
+      return (
+        <div
+          role="alert"
+          aria-live="assertive"
+          className="flex flex-col items-center justify-center h-[300px] gap-3 text-center px-4"
+        >
+          <p className="text-sm font-medium text-red-600 dark:text-red-400">
+            Failed to load spending analytics.
+          </p>
+          <p className="text-xs text-gray-500 dark:text-gray-400">{error}</p>
+          {onRetry && (
+            <button
+              type="button"
+              onClick={onRetry}
+              className="mt-1 rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2"
+            >
+              Retry
+            </button>
+          )}
+        </div>
+      );
+    }
+
+    if (!hasData) {
+      return (
+        <div
+          role="status"
+          aria-live="polite"
+          className="flex flex-col items-center justify-center h-[300px] gap-2 text-center px-4"
+        >
+          <p className="text-sm font-medium text-gray-700 dark:text-gray-200">No spending data yet</p>
+          <p className="text-xs text-gray-500 dark:text-gray-400">
+            Once you complete bookings, your monthly spending will appear here.
+          </p>
+        </div>
+      );
+    }
+
+    return (
+      <ResponsiveContainer width="100%" height={300}>
+        <BarChart data={data}>
+          <CartesianGrid strokeDasharray="3 3" />
+          <XAxis dataKey="month" />
+          <YAxis />
+          <Tooltip />
+          <Legend />
+          <Bar dataKey="spent" fill="#3b82f6" name="USDC Spent" />
+        </BarChart>
+      </ResponsiveContainer>
+    );
+  };
 
   return (
-    <div className="bg-white dark:bg-gray-900 rounded-lg shadow-sm border border-gray-100 dark:border-gray-700 p-4 sm:p-6">
+    <div className="bg-white dark:bg-gray-900 rounded-lg shadow-sm border border-gray-100 dark:border-gray-700 p-6">
       <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Spending Analytics</h3>
-
-      <div
-        className="w-full overflow-hidden"
-        role="img"
-        aria-label={chartDescription}
-      >
-        <div className="w-full min-w-0" aria-hidden="true">
-          <ResponsiveContainer width="100%" height={300}>
-            <BarChart data={chartData} margin={{ top: 8, right: 8, bottom: 8, left: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#d1d5db" />
-              <XAxis dataKey="month" tick={{ fill: '#374151' }} />
-              <YAxis tick={{ fill: '#374151' }} width={48} />
-              <Tooltip
-                contentStyle={{ color: '#111827', backgroundColor: '#ffffff', border: '1px solid #d1d5db' }}
-              />
-              <Legend wrapperStyle={{ color: '#374151' }} />
-              <Bar dataKey="spent" fill="#2563eb" name="USDC Spent" />
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-      </div>
-
-      <div className="sr-only">
-        <table>
-          <caption>Monthly USDC spending summary</caption>
-          <thead>
-            <tr>
-              <th scope="col">Month</th>
-              <th scope="col">USDC Spent</th>
-            </tr>
-          </thead>
-          <tbody>
-            {chartData.map((item) => (
-              <tr key={item.month}>
-                <th scope="row">{item.month}</th>
-                <td>{item.spent}</td>
-              </tr>
-            ))}
-          </tbody>
-          <tfoot>
-            <tr>
-              <th scope="row">Total</th>
-              <td>{totalSpent}</td>
-            </tr>
-          </tfoot>
-        </table>
-      </div>
+      {renderBody()}
     </div>
   );
 }
-</｜｜DSML｜｜ parameter>

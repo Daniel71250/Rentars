@@ -1,4 +1,5 @@
 import { supabase } from '@/config/supabase.js';
+import { normalizeSearchQuery, redactAnalyticsFilters } from '@/utils/searchMetrics.js';
 import type { ServiceResponse } from './index.js';
 
 export interface SearchAnalytic {
@@ -28,125 +29,25 @@ export interface DailyVolume {
 }
 
 /**
- * Minimum number of distinct events a cohort must contain before it is
- * surfaced through standard admin analytics. Cohorts below this threshold are
- * suppressed to prevent user-level behavioral surveillance.
- */
-export const MIN_AGGREGATION_THRESHOLD = 5;
-
-/**
- * Maximum span (in days) allowed for a single analytics query window.
- */
-export const MAX_TIME_WINDOW_DAYS = 90;
-
-/**
- * Allowlisted filter keys that may be applied to analytics queries. Arbitrary
- * filtering is rejected to prevent narrowing cohorts down to individuals.
- */
-export const ALLOWED_ANALYTICS_FILTERS = ['category', 'content_type', 'result_bucket'] as const;
-export type AllowedAnalyticsFilter = (typeof ALLOWED_ANALYTICS_FILTERS)[number];
-
-export interface AnalyticsQueryOptions {
-  /** Allowlisted filters only; unknown keys are rejected. */
-  filters?: Partial<Record<AllowedAnalyticsFilter, string>>;
-}
-
-export interface AnalyticsMeta {
-  start_date: string;
-  end_date: string;
-  min_cohort_size: number;
-  suppressed: boolean;
-}
-
-export interface AggregatedTopQuery {
-  /** Normalized query bucket (lowercased, trimmed, truncated). */
-  query_bucket: string;
-  frequency: number;
-  avg_results?: number;
-}
-
-export interface AggregatedDailyVolume {
-  date: string;
-  count: number;
-}
-
-export interface AggregatedTrendingSearch {
-  query_bucket: string;
-  frequency: number;
-}
-
-export interface AggregatedResult<T> {
-  items: T[];
-  meta: AnalyticsMeta;
-}
-
-const MAX_QUERY_BUCKET_LENGTH = 64;
-
-/**
- * Normalize a raw query string into a non-identifying bucket. Raw query
- * strings may contain PII (emails, names, addresses) so we lowercase, collapse
- * whitespace, strip obvious PII patterns, and truncate.
- */
-export function normalizeQueryBucket(rawQuery: string): string {
-  const collapsed = (rawQuery ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
-  // Strip email-like and long numeric sequences that could identify a user.
-  const scrubbed = collapsed
-    .replace(/[^\s@]+@[^\s@]+\.[^\s@]+/g, '[redacted]')
-    .replace(/\b\d{6,}\b/g, '[redacted]');
-  return scrubbed.slice(0, MAX_QUERY_BUCKET_LENGTH);
-}
-
-function validateTimeWindow(startDate: string, endDate: string): string | null {
-  const start = new Date(startDate);
-  const end = new Date(endDate);
-  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
-    return 'Invalid date range';
-  }
-  if (start > end) {
-    return 'start_date must be before end_date';
-  }
-  const spanDays = (end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24);
-  if (spanDays > MAX_TIME_WINDOW_DAYS) {
-    return `Date range exceeds maximum window of ${MAX_TIME_WINDOW_DAYS} days`;
-  }
-  return null;
-}
-
-function validateFilters(filters?: Record<string, unknown>): string | null {
-  if (!filters) return null;
-  for (const key of Object.keys(filters)) {
-    if (!(ALLOWED_ANALYTICS_FILTERS as readonly string[]).includes(key)) {
-      return `Filter '${key}' is not permitted for analytics queries`;
-    }
-  }
-  return null;
-}
-
-function buildMeta(startDate: string, endDate: string, suppressed: boolean): AnalyticsMeta {
-  return {
-    start_date: startDate,
-    end_date: endDate,
-    min_cohort_size: MIN_AGGREGATION_THRESHOLD,
-    suppressed,
-  };
-}
-
-/**
- * Track a search query for analytics and suggestions.
+ * Track a search query for analytics and suggestions (issue #935).
+ *
+ * Privacy rule: raw queries and personal identifiers are never stored. The
+ * query is normalised/redacted, filters are reduced to broad aggregate keys,
+ * and the caller's user id is deliberately ignored (searches are anonymous).
  */
 export async function trackSearch(
   query: string,
   resultCount: number,
-  userId?: string,
+  _userId?: string,
   filters?: Record<string, unknown>,
 ): Promise<ServiceResponse<SearchAnalytic>> {
   const { data, error } = await supabase
     .from('search_analytics')
     .insert({
-      query: query.toLowerCase(),
-      filters,
+      query: normalizeSearchQuery(query) || '[redacted]',
+      filters: redactAnalyticsFilters(filters) ?? null,
       result_count: resultCount,
-      user_id: userId,
+      user_id: null,
       created_at: new Date().toISOString(),
     })
     .select()
@@ -204,38 +105,12 @@ export async function getTopQueries(
   });
 
   if (error) return { success: false, error: error.message };
+  return { success: true, data: sanitizeTopQueries((data ?? []) as TopQuery[]) };
+}
 
-  const buckets = new Map<string, { frequency: number; totalResults: number }>();
-  for (const row of (data ?? []) as TopQuery[]) {
-    const bucket = normalizeQueryBucket(row.query);
-    if (!bucket) continue;
-    const existing = buckets.get(bucket);
-    if (existing) {
-      existing.frequency += row.frequency;
-      existing.totalResults += (row.avg_results ?? 0) * row.frequency;
-    } else {
-      buckets.set(bucket, {
-        frequency: row.frequency,
-        totalResults: (row.avg_results ?? 0) * row.frequency,
-      });
-    }
-  }
-
-  const items: AggregatedTopQuery[] = [];
-  for (const [query_bucket, agg] of buckets) {
-    if (agg.frequency < MIN_AGGREGATION_THRESHOLD) continue;
-    items.push({
-      query_bucket,
-      frequency: agg.frequency,
-      avg_results: agg.frequency > 0 ? agg.totalResults / agg.frequency : undefined,
-    });
-  }
-  items.sort((a, b) => b.frequency - a.frequency);
-
-  return {
-    success: true,
-    data: { items: items.slice(0, limit), meta: buildMeta(startDate, endDate, items.length === 0) },
-  };
+/** Never expose a raw (potentially personal) query through admin reporting. */
+function sanitizeTopQueries(rows: TopQuery[]): TopQuery[] {
+  return rows.map((row) => ({ ...row, query: normalizeSearchQuery(row.query) || '[redacted]' }));
 }
 
 /**
@@ -260,38 +135,33 @@ export async function getZeroResultQueries(
   });
 
   if (error) return { success: false, error: error.message };
+  return { success: true, data: sanitizeTopQueries((data ?? []) as TopQuery[]) };
+}
 
-  const buckets = new Map<string, { frequency: number; totalResults: number }>();
-  for (const row of (data ?? []) as TopQuery[]) {
-    const bucket = normalizeQueryBucket(row.query);
-    if (!bucket) continue;
-    const existing = buckets.get(bucket);
-    if (existing) {
-      existing.frequency += row.frequency;
-      existing.totalResults += (row.avg_results ?? 0) * row.frequency;
-    } else {
-      buckets.set(bucket, {
-        frequency: row.frequency,
-        totalResults: (row.avg_results ?? 0) * row.frequency,
-      });
-    }
-  }
+/**
+ * Delete legacy raw analytics rows belonging to a user (deletion requests).
+ * New writes are anonymous, but old rows may still carry a user_id.
+ */
+export async function deleteSearchAnalyticsForUser(
+  userId: string,
+): Promise<ServiceResponse<null>> {
+  const { error } = await supabase.from('search_analytics').delete().eq('user_id', userId);
+  if (error) return { success: false, error: error.message };
+  return { success: true, data: null };
+}
 
-  const items: AggregatedTopQuery[] = [];
-  for (const [query_bucket, agg] of buckets) {
-    if (agg.frequency < MIN_AGGREGATION_THRESHOLD) continue;
-    items.push({
-      query_bucket,
-      frequency: agg.frequency,
-      avg_results: agg.frequency > 0 ? agg.totalResults / agg.frequency : undefined,
-    });
-  }
-  items.sort((a, b) => b.frequency - a.frequency);
-
-  return {
-    success: true,
-    data: { items: items.slice(0, limit), meta: buildMeta(startDate, endDate, items.length === 0) },
-  };
+/**
+ * Enforce the approved retention window for raw search events.
+ */
+export async function deleteSearchAnalyticsBefore(
+  cutoff: Date,
+): Promise<ServiceResponse<null>> {
+  const { error } = await supabase
+    .from('search_analytics')
+    .delete()
+    .lt('created_at', cutoff.toISOString());
+  if (error) return { success: false, error: error.message };
+  return { success: true, data: null };
 }
 
 /**
@@ -332,13 +202,13 @@ export async function trackSuggestionEvent(
   eventType: 'offered' | 'accepted',
   suggestionType: string,
   originalQuery?: string,
-  userId?: string,
+  _userId?: string,
 ): Promise<void> {
   await supabase.from('search_suggestion_events').insert({
     event_type: eventType,
     suggestion_type: suggestionType,
-    original_query: originalQuery,
-    user_id: userId,
+    original_query: originalQuery ? normalizeSearchQuery(originalQuery) : null,
+    user_id: null,
   });
 }
 

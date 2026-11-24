@@ -3,6 +3,7 @@ import { rateLimitStore } from '@/services/rateLimitStore.service.js';
 import { setFeatured, clearFeatured, FEATURED_CAP } from '@/services/property.service.js';
 import { getTopQueries, getZeroResultQueries, getDailySearchVolume } from '@/services/searchAnalytics.service.js';
 import { auditLogger } from '@/services/auditLogger.service.js';
+import { BookingService } from '@/services/booking.service.js';
 import { supabase } from '@/config/supabase.js';
 import type { AdminRequest } from '@/middleware/admin.middleware.js';
 import { changeUserRole } from '@/services/roleAssignment.service.js';
@@ -80,6 +81,22 @@ export async function setFeaturedHandler(req: Request, res: Response): Promise<v
     return;
   }
 
+  // Audit the promotion change so admin actions are traceable.
+  const adminId = (req as AdminRequest).adminId;
+  await auditLogger
+    .log({
+      actorId: adminId,
+      action: 'admin.featured_set',
+      resourceType: 'property',
+      resourceId: propertyId,
+      meta: {
+        featured_until,
+        weight,
+        featured_cap: FEATURED_CAP,
+      },
+    })
+    .catch((err) => console.error('[setFeaturedHandler] audit log failed:', err));
+
   res.json({
     data: result.data,
     meta: {
@@ -109,6 +126,18 @@ export async function clearFeaturedHandler(req: Request, res: Response): Promise
     res.status(400).json({ error: result.error });
     return;
   }
+
+  // Audit the removal so admin actions are traceable.
+  const adminId = (req as AdminRequest).adminId;
+  await auditLogger
+    .log({
+      actorId: adminId,
+      action: 'admin.featured_clear',
+      resourceType: 'property',
+      resourceId: propertyId,
+      meta: { reason: 'admin_clear' },
+    })
+    .catch((err) => console.error('[clearFeaturedHandler] audit log failed:', err));
 
   res.json({
     data: result.data,
@@ -759,19 +788,38 @@ export async function resolveDispute(req: AdminRequest, res: Response): Promise<
 
   const { resolution_note, outcome } = parsed.data;
 
-  const { error } = await supabase
+  const { data: booking, error: loadError } = await supabase
     .from('bookings')
-    .update({
-      status: 'dispute_resolved',
-      dispute_resolution_note: resolution_note,
-      dispute_resolved_at: new Date().toISOString(),
-      dispute_outcome: outcome ?? null,
-    })
+    .select('status')
     .eq('id', id)
-    .eq('status', 'disputed');
+    .maybeSingle();
+  if (loadError) {
+    res.status(500).json({ error: { code: 'DB_ERROR', message: loadError.message } });
+    return;
+  }
+  if (!booking) {
+    res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Booking not found' } });
+    return;
+  }
 
-  if (error) {
-    res.status(500).json({ error: { code: 'DB_ERROR', message: error.message } });
+  const currentStatus = String((booking as { status?: string }).status ?? '');
+  const fromStatus = currentStatus.toLowerCase() === 'disputed' ? 'Disputed' : currentStatus;
+  const toStatus = outcome === 'release_to_host' ? 'Completed' : 'Cancelled';
+
+  // Route through the state machine: the status change and its history entry
+  // are committed together, and invalid transitions write no history.
+  const transition = await new BookingService().transitionStatus(
+    id,
+    fromStatus,
+    toStatus,
+    req.adminId,
+    resolution_note,
+    { dispute_status: 'resolved' },
+  );
+  if (!transition.success) {
+    res.status(transition.statusCode ?? 409).json({
+      error: { code: 'INVALID_TRANSITION', message: transition.error },
+    });
     return;
   }
 
