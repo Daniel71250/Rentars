@@ -71,30 +71,38 @@ function ResponsiveDisclosure({
 
 // ─── URL ↔ filter helpers ─────────────────────────────────────────────────────
 
+/**
+ * Serialises active filters to URL search params.
+ * Note: when checkIn + checkOut are both set, the backend bypasses its result
+ * cache (availability is real-time), which is intentional.
+ */
 function filtersToParams(filters: FilterState, query: string): URLSearchParams {
   const p = new URLSearchParams();
-  if (query)                              p.set('q',         query);
-  if (filters.priceMin > 0)              p.set('priceMin',  String(filters.priceMin));
-  if (filters.priceMax < 1000)           p.set('priceMax',  String(filters.priceMax));
-  if (filters.guests > 1)               p.set('guests',    String(filters.guests));
-  if (filters.bedrooms)                  p.set('bedrooms',  String(filters.bedrooms));
-  if (filters.checkIn)                   p.set('checkIn',   filters.checkIn);
-  if (filters.checkOut)                  p.set('checkOut',  filters.checkOut);
-  if (filters.propertyType)              p.set('type',      filters.propertyType);
+  if (query)                              p.set('q',           query);
+  if (filters.priceMin > 0)              p.set('priceMin',    String(filters.priceMin));
+  if (filters.priceMax < 1000)           p.set('priceMax',    String(filters.priceMax));
+  if (filters.guests > 1)               p.set('guests',      String(filters.guests));
+  if (filters.bedrooms)                  p.set('bedrooms',    String(filters.bedrooms));
+  if (filters.minBathrooms !== undefined) p.set('minBathrooms', String(filters.minBathrooms));
+  if (filters.checkIn)                   p.set('checkIn',     filters.checkIn);
+  if (filters.checkOut)                  p.set('checkOut',    filters.checkOut);
+  if (filters.propertyType)              p.set('type',        filters.propertyType);
   if (filters.sortBy && filters.sortBy !== 'newest') p.set('sortBy', filters.sortBy);
+  filters.amenities?.forEach(a => p.append('amenities', a));
   return p;
 }
 
 function paramsToFilters(p: URLSearchParams): FilterState {
   return {
-    priceMin:     p.has('priceMin')  ? Number(p.get('priceMin'))  : 0,
-    priceMax:     p.has('priceMax')  ? Number(p.get('priceMax'))  : 1000,
-    guests:       p.has('guests')    ? Number(p.get('guests'))    : 1,
-    bedrooms:     p.has('bedrooms')  ? Number(p.get('bedrooms'))  : undefined,
+    priceMin:     p.has('priceMin')      ? Number(p.get('priceMin'))      : 0,
+    priceMax:     p.has('priceMax')      ? Number(p.get('priceMax'))      : 1000,
+    guests:       p.has('guests')        ? Number(p.get('guests'))        : 1,
+    bedrooms:     p.has('bedrooms')      ? Number(p.get('bedrooms'))      : undefined,
+    minBathrooms: p.has('minBathrooms')  ? Number(p.get('minBathrooms'))  : undefined,
     amenities:    p.getAll('amenities'),
-    checkIn:      p.get('checkIn')   ?? undefined,
-    checkOut:     p.get('checkOut')  ?? undefined,
-    propertyType: p.get('type')      ?? '',
+    checkIn:      p.get('checkIn')       ?? undefined,
+    checkOut:     p.get('checkOut')      ?? undefined,
+    propertyType: p.get('type')          ?? '',
     sortBy:       (p.get('sortBy') as FilterState['sortBy']) ?? 'newest',
   };
 }
@@ -409,6 +417,25 @@ export default function SearchPage() {
           >
             <AlertCircle size={15} aria-hidden="true" />
             {geoError}
+          </div>
+        )}
+
+        {/* Availability notice — shown when both date filters are active */}
+        {filters.checkIn && filters.checkOut && !displayLoading && (
+          <div
+            role="status"
+            className="mb-4 flex items-center gap-2 rounded-lg border border-teal-200 dark:border-teal-800
+              bg-teal-50 dark:bg-teal-950/30 text-teal-700 dark:text-teal-300 text-sm px-4 py-3"
+          >
+            <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24"
+              stroke="currentColor" strokeWidth={2} aria-hidden="true">
+              <path strokeLinecap="round" strokeLinejoin="round"
+                d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            Showing properties available from{' '}
+            <strong className="mx-1">{filters.checkIn}</strong> to{' '}
+            <strong className="mx-1">{filters.checkOut}</strong>.
+            Booking confirmation performs a final availability check.
           </div>
         )}
 

@@ -20,6 +20,7 @@ import {
   getDraftHandler,
   updateDraftHandler,
   publishDraftHandler,
+  getPublishReadinessHandler,
   getPropertyVersionsHandler,
   rollbackPropertyVersionHandler,
 } from '@/controllers/property.controller.js';
@@ -125,6 +126,9 @@ router.patch('/:id/draft', authenticate, updateDraftHandler);
 
 // PATCH /api/v1/properties/:id/publish - publish draft to active (idempotent)
 router.patch('/:id/publish', authenticate, publishDraftHandler);
+
+// GET /api/v1/properties/:id/publish-readiness - publish readiness check (owner-only)
+router.get('/:id/publish-readiness', authenticate, getPublishReadinessHandler);
 
 // ── Property Management ────────────────────────────────────────────────────────
 

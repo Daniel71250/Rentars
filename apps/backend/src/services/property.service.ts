@@ -1131,7 +1131,7 @@ export async function advancedSearch(
     const { data: bookedRows } = await supabase
       .from('bookings')
       .select('property_id')
-      .neq('status', 'Cancelled')
+      .in('status', [...ACTIVE_BOOKING_STATUSES])
       .lt('check_in', filters.checkOut)
       .gt('check_out', filters.checkIn);
 
