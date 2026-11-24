@@ -732,6 +732,82 @@ of pre-identified gaps stays auditable. If the retrospective identifies
 additional gaps from the 2026-10-25 run, append them here in the same format
 with an owner and a due date before the issue is closed.
 
+#### 7.2.2 Follow-up risks — recovery drill 2026-11-01 (FAILED)
+
+The recovery drill run on **2026-11-01** failed during preflight, before any
+phase ran. The [workflow run](https://github.com/Rentars/Rentars/actions/runs/41294701720)
+log reports `Missing required env var: STAGING_API_URL` and
+`Missing required env var: ADMIN_JWT`, so no staging calls were made and no
+JSON report was produced. `ADMIN_JWT` is sourced from the
+`RECOVERY_DRILL_ADMIN_JWT` secret in
+[`.github/workflows/recovery-drill.yml`](../.github/workflows/recovery-drill.yml).
+
+| # | Risk / gap (from the 2026-11-01 drill report) | Source (step) | Owner (A) | Due date | Tracking link | Status |
+|---|---|---|---|---|---|---|
+| N1-1 | `STAGING_API_URL` is unavailable in the `staging` environment; the drill aborts before §6.2–§6.7 can run. | §6.1 | Infra Owner | 2026-11-10 | [#902](https://github.com/Rentars/Rentars/issues/902) | Open |
+| N1-2 | `ADMIN_JWT` (from secret `RECOVERY_DRILL_ADMIN_JWT`) is missing, so authenticated admin phases cannot run. | §6.1 | Infra Owner | 2026-11-10 | [#902](https://github.com/Rentars/Rentars/issues/902) | Open |
+| N1-3 | No workflow preflight check names the missing staging secrets before the drill starts, delaying diagnosis. | §6.1 | On-Call SRE | 2026-11-17 | [#902](https://github.com/Rentars/Rentars/issues/902) | Open |
+
+Every row has an owner and a due date. The Incident Commander verifies closure
+at the retrospective (§7) before issue #902 is closed.
+
+#### 7.2.3 Follow-up risks — recovery drill 2026-11-02 (FAILED)
+
+The recovery drill run on **2026-11-02** failed during preflight, before any
+phase ran. The [workflow run](https://github.com/Rentars/Rentars/actions/runs/41426269457)
+log reports `Missing required env var: STAGING_API_URL` and
+`Missing required env var: ADMIN_JWT`, so no staging calls were made and no
+JSON report was produced. `ADMIN_JWT` is sourced from the
+`RECOVERY_DRILL_ADMIN_JWT` secret in
+[`.github/workflows/recovery-drill.yml`](../.github/workflows/recovery-drill.yml).
+
+| # | Risk / gap (from the 2026-11-02 drill report) | Source (step) | Owner (A) | Due date | Tracking link | Status |
+|---|---|---|---|---|---|---|
+| N2-1 | `STAGING_API_URL` is unavailable in the `staging` environment; the drill aborts before §6.2–§6.7 can run. | §6.1 | Infra Owner | 2026-11-11 | [#903](https://github.com/Rentars/Rentars/issues/903) | Open |
+| N2-2 | `ADMIN_JWT` (from secret `RECOVERY_DRILL_ADMIN_JWT`) is missing, so authenticated admin phases cannot run. | §6.1 | Infra Owner | 2026-11-11 | [#903](https://github.com/Rentars/Rentars/issues/903) | Open |
+| N2-3 | No workflow preflight check names the missing staging secrets before the drill starts, delaying diagnosis. | §6.1 | On-Call SRE | 2026-11-18 | [#903](https://github.com/Rentars/Rentars/issues/903) | Open |
+
+Every row has an owner and a due date. The Incident Commander verifies closure
+at the retrospective (§7) before issue #903 is closed.
+
+#### 7.2.4 Follow-up risks — recovery drill 2026-11-03 (FAILED)
+
+The recovery drill run on **2026-11-03** failed during preflight, before any
+phase ran. The [workflow run](https://github.com/Rentars/Rentars/actions/runs/41616950480)
+log reports `Missing required env var: STAGING_API_URL` and
+`Missing required env var: ADMIN_JWT`, so no staging calls were made and no
+JSON report was produced. `ADMIN_JWT` is sourced from the
+`RECOVERY_DRILL_ADMIN_JWT` secret in
+[`.github/workflows/recovery-drill.yml`](../.github/workflows/recovery-drill.yml).
+
+| # | Risk / gap (from the 2026-11-03 drill report) | Source (step) | Owner (A) | Due date | Tracking link | Status |
+|---|---|---|---|---|---|---|
+| N3-1 | `STAGING_API_URL` is unavailable in the `staging` environment; the drill aborts before §6.2–§6.7 can run. | §6.1 | Infra Owner | 2026-11-12 | [#904](https://github.com/Rentars/Rentars/issues/904) | Open |
+| N3-2 | `ADMIN_JWT` (from secret `RECOVERY_DRILL_ADMIN_JWT`) is missing, so authenticated admin phases cannot run. | §6.1 | Infra Owner | 2026-11-12 | [#904](https://github.com/Rentars/Rentars/issues/904) | Open |
+| N3-3 | No workflow preflight check names the missing staging secrets before the drill starts, delaying diagnosis. | §6.1 | On-Call SRE | 2026-11-19 | [#904](https://github.com/Rentars/Rentars/issues/904) | Open |
+
+Every row has an owner and a due date. The Incident Commander verifies closure
+at the retrospective (§7) before issue #904 is closed.
+
+#### 7.2.5 Follow-up risks — recovery drill 2026-11-04 (FAILED)
+
+The recovery drill run on **2026-11-04** failed during preflight, before any
+phase ran. The [workflow run](https://github.com/Rentars/Rentars/actions/runs/41811187115)
+log reports `Missing required env var: STAGING_API_URL` and
+`Missing required env var: ADMIN_JWT`, so no staging calls were made and no
+JSON report was produced. `ADMIN_JWT` is sourced from the
+`RECOVERY_DRILL_ADMIN_JWT` secret in
+[`.github/workflows/recovery-drill.yml`](../.github/workflows/recovery-drill.yml).
+
+| # | Risk / gap (from the 2026-11-04 drill report) | Source (step) | Owner (A) | Due date | Tracking link | Status |
+|---|---|---|---|---|---|---|
+| N4-1 | `STAGING_API_URL` is unavailable in the `staging` environment; the drill aborts before §6.2–§6.7 can run. | §6.1 | Infra Owner | 2026-11-13 | [#905](https://github.com/Rentars/Rentars/issues/905) | Open |
+| N4-2 | `ADMIN_JWT` (from secret `RECOVERY_DRILL_ADMIN_JWT`) is missing, so authenticated admin phases cannot run. | §6.1 | Infra Owner | 2026-11-13 | [#905](https://github.com/Rentars/Rentars/issues/905) | Open |
+| N4-3 | No workflow preflight check names the missing staging secrets before the drill starts, delaying diagnosis. | §6.1 | On-Call SRE | 2026-11-20 | [#905](https://github.com/Rentars/Rentars/issues/905) | Open |
+
+Every row has an owner and a due date. The Incident Commander verifies closure
+at the retrospective (§7) before issue #905 is closed.
+
 ### 7.3 Drill history
 
 | Date | Env | Commander | Result | Aggregate reads | Lookup+recon | Report |
