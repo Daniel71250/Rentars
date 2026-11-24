@@ -53,6 +53,17 @@ export const createBookingSchema = z
       .positive('total_price must be positive')
       .optional(),
 
+    /** Server-generated quote identity and acceptance, required before a booking is created. */
+    quote_id: z
+      .string({ required_error: 'quote_id is required' })
+      .uuid('quote_id must be a valid UUID'),
+    quote_token: z
+      .string({ required_error: 'quote_token is required' })
+      .min(1, 'quote_token must not be empty'),
+    quote_accepted_at: z
+      .string({ required_error: 'quote_accepted_at is required' })
+      .datetime('quote_accepted_at must be a valid ISO 8601 datetime'),
+
     stellar_address: z
       .string()
       .regex(/^G[A-Z2-7]{55}$/, 'stellar_address must be a valid Stellar public key')

@@ -262,8 +262,13 @@ export async function createBooking(req: Request, res: Response): Promise<void> 
     const lockResult = await lockKey(userId, trimmedKey, requestHash);
 
     if (!lockResult.success) {
-      // DB error during lock — fail safe rather than blocking all bookings.
+      // Financial operations must fail closed: without a durable claim we cannot
+      // guarantee that a retry will not create a second pending booking.
       console.error('[idempotency] lock error:', lockResult.error);
+      res.status(503).json({
+        error: 'Booking could not be safely started. Please retry with the same Idempotency-Key.',
+      });
+      return;
     } else if (lockResult.data) {
       const lockData = lockResult.data;
 
